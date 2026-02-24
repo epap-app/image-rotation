@@ -42,6 +42,26 @@ class AndroidStateReader:
                 pkgs.append(line.split("package:", 1)[1])
         return pkgs
 
+    def list_package_paths_for_user(self, uid: int) -> dict[str, str]:
+        """
+        Return package -> code path mapping for a user from:
+          pm list packages -f --user <uid>
+        """
+        res = self.adb.shell_root(f"pm list packages -f --user {uid} 2>/dev/null || true", check=False)
+        out = res.stdout or ""
+        out_map: dict[str, str] = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("package:"):
+                continue
+            body = line.split("package:", 1)[1]
+            if "=" not in body:
+                continue
+            path, pkg = body.rsplit("=", 1)
+            if pkg:
+                out_map[pkg] = path
+        return out_map
+
     def list_overlay_pkgs_for_user(self, uid: int) -> list[str]:
         res = self.adb.shell_root(f"cmd overlay list --user {uid} 2>/dev/null || true", check=False)
         out = res.stdout or ""
@@ -86,6 +106,35 @@ class AndroidStateReader:
                 pkgs.add(line.split("package:", 1)[1])
         self._thirdparty_cache = pkgs
         return pkgs
+
+    def list_thirdparty_pkgs_for_user(self, uid: int) -> set[str]:
+        """
+        Third-party packages for a specific user.
+        Prefer user-scoped query when supported; fallback to global -3 set.
+        """
+        res = self.adb.shell_root(f"pm list packages -3 --user {uid} 2>/dev/null || true", check=False)
+        out = res.stdout or ""
+        pkgs: set[str] = set()
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                pkgs.add(line.split("package:", 1)[1])
+        # Path-based inference catches ROMs where `pm -3` output is incomplete.
+        # Treat /data-installed packages as third-party for scope filtering.
+        inferred: set[str] = set()
+        for pkg, apk_path in self.list_package_paths_for_user(uid).items():
+            if apk_path.startswith("/data/app/") or apk_path.startswith("/mnt/expand/"):
+                inferred.add(pkg)
+
+        if pkgs:
+            return pkgs | inferred
+
+        # Some ROMs/su setups return empty for user-scoped -3. Try global -3.
+        global_third = set(self.list_thirdparty_pkgs())
+        if global_third:
+            return global_third | inferred
+
+        return inferred
 
     def read_device_state(self) -> dict:
         return {"user_ids": self.get_all_user_ids()}

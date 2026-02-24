@@ -1,276 +1,299 @@
 # Android Snaptool
 
-A host-side Python tool (`recovery_tool.py`) to **backup** and **restore** Android **`/data`** using **ADB + root (`su`)**.
+Android Snaptool is a host-side Python CLI (`recovery_tool.py`) for rooted Android backup/restore workflows.
 
-- **backup** → creates `snapshots/<name>/data.tar.zst`
-- **restore-path (recommended)** → restores app + media state in a staged way designed to preserve app login sessions
+Supported commands:
 
-> Requires a rooted **Pixel 7** device (working `su`). Tested on Pixel 7 **Android 13**.
+- `backup` - full `/data` snapshot (with built-in excludes)
+- `backup-thirdparty` - backup third-party app state for all users (or selected users)
+- `backup-app` - fast snapshot for one app
+- `restore-path` - restore from full snapshot with package scope filtering
+- `restore-app` - restore one app snapshot
+- `restore-thirdparty` - restore a `backup-thirdparty` snapshot
 
----
+## Requirements
 
-## Host dependencies
-
-You need these tools installed on your computer:
-
-- Python **3.8+** (3.10+ recommended)
-- `adb` (Android platform-tools)
+- Rooted Android device with working `su`
+- `adb`
+- `python3`
 - `tar`
 - `zstd`
 
-### Ubuntu / Debian
+Quick dependency install on Ubuntu/Debian:
 
 ```bash
 sudo apt update
 sudo apt install -y adb zstd tar python3 python3-pip
 ```
 
-### Verify the tools
+## Global CLI Syntax
 
 ```bash
-python3 --version
-adb version
-zstd --version
-tar --version
+python3 recovery_tool.py [--serial SERIAL] [--snap-root PATH] [--verbose] <command> [command options]
 ```
 
----
+Global options:
 
-## Phone setup (Pixel 7)
+- `--serial SERIAL` - target specific ADB device
+- `--snap-root PATH` - store/read snapshots from custom directory
+- `--verbose` - verbose logging
 
-### Enable USB debugging
+Important: global options must be placed before the subcommand.
 
-1. **Settings → About phone** → tap **Build number** 7 times
-2. **Settings → System → Developer options** → enable **USB debugging**
-3. Plug in the USB cable
-4. Unlock the phone and accept the **Allow USB debugging** prompt
-
-### Verify ADB connection
+Correct:
 
 ```bash
-adb devices
+python3 recovery_tool.py --verbose restore-app my-snap
 ```
 
-Expected output:
-
-```text
-<serial>    device
-```
-
-If you see `unauthorized`:
+Incorrect:
 
 ```bash
-adb kill-server
-adb start-server
-adb devices
+python3 recovery_tool.py restore-app my-snap --verbose
 ```
 
-Then unlock the phone and accept the prompt again.
+## Command Reference
 
-### Verify root (`su`)
+### 1) `backup`
+
+Creates a full `/data` snapshot (excluding volatile paths configured in the tool).
+
+Usage:
 
 ```bash
-adb shell su -c id
+python3 recovery_tool.py backup [--name NAME]
 ```
-
-Expected output includes:
-
-```text
-uid=0(root)
-```
-
----
-
-## How to run the tool
-
-Run commands from the project folder (where `recovery_tool.py` exists).
-
-### Show help
-
-```bash
-python3 recovery_tool.py -h
-```
-
-### Show help for specific commands
-
-```bash
-python3 recovery_tool.py backup -h
-python3 recovery_tool.py restore-path -h
-```
-
----
-
-## 1) Backup (create a snapshot)
-
-Create a snapshot:
-
-```bash
-python3 recovery_tool.py backup --name initial
-```
-
-This creates:
-
-- `snapshots/initial/data.tar.zst`
-
-You can choose any name:
-
-```bash
-python3 recovery_tool.py backup --name before_update
-python3 recovery_tool.py backup --name snap-20251220-1400
-```
-
----
-
-## 2) Restore: `restore-path`
-
-This is the safer restore mode and usually preserves login sessions.
-
-### Usage
-
-```bash
-python3 recovery_tool.py restore-path <snapshot-name> --pkg-scope <scope>
-```
-
-### `--pkg-scope` options
-
-- `apps` (**default**): installed packages excluding overlays
-- `thirdparty`: third-party apps only
-- `system`: system apps only
-- `all`: all installed packages (includes overlays)
-
-### Examples
-
-```bash
-python3 recovery_tool.py restore-path initial --pkg-scope apps # Will restore all of the apps (system + thirdparty)
-python3 recovery_tool.py restore-path initial --pkg-scope thirdparty # Will restore only thirdparty apps (non-system apps)
-python3 recovery_tool.py restore-path initial --pkg-scope system # Will restore only system apps (third party apps not included)
-```
-
-### Optional reboot after `restore-path`
-
-Some apps behave better after a reboot:
-
-```bash
-adb reboot
-```
-
----
-
-## Where snapshots are stored
-
-Snapshots are stored under:
-
-- `snapshots/<snapshot-name>/`
-
-A snapshot contains:
-
-- `data.tar.zst` (your compressed `/data` backup)
-- optional `logs/` folder (if your tool writes logs)
-
----
-
-## Logs: how to view and debug
-
-### A) Tool logs (if present)
-
-Many versions of this tool write logs under:
-
-- `snapshots/<snapshot-name>/logs/`
 
 Examples:
 
 ```bash
-ls -la snapshots/initial/logs/
-cat snapshots/initial/logs/restore-path.log
-tail -n 200 snapshots/initial/logs/restore-path.log
+python3 recovery_tool.py backup
+python3 recovery_tool.py backup --name zero
+python3 recovery_tool.py --verbose --serial <device_serial> backup --name before_update
 ```
 
-If your project does not create `logs/` yet, the console output is still the primary log.
+### 2) `backup-thirdparty`
 
-### B) ADB logs (device logs)
+Creates one snapshot containing third-party app state across all users (or selected users).
 
-These help when an app crashes or MediaProvider/Photos misbehaves.
+Included by default:
 
-Crash buffer (best for app crashes):
+- third-party app CE/DE data per selected user
+- app external state (`Android/data`, `Android/media`, `Android/obb`)
+- default auth package data (`com.google.android.gsf.login`), if installed
+- account bundle (AccountManager DB + keystore/locksettings)
+- permission/appops state needed for restore replay
+
+Usage:
+
+```bash
+python3 recovery_tool.py backup-thirdparty [--name NAME] [--user USER ...] [--auth-pkg PKG ...] [--no-account-db]
+```
+
+Options:
+
+- `--name NAME` - snapshot name
+- `--user USER` - repeatable, include only selected Android users
+- `--auth-pkg PKG` - repeatable, include extra auth package data
+- `--no-account-db` - skip account bundle files
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose backup-thirdparty --name zero3party
+python3 recovery_tool.py backup-thirdparty --name work_only --user 10
+python3 recovery_tool.py backup-thirdparty --name u0_u10 --user 0 --user 10
+python3 recovery_tool.py backup-thirdparty --name with_auth --auth-pkg com.example.auth
+python3 recovery_tool.py backup-thirdparty --name no_accounts --no-account-db
+```
+
+### 3) `backup-app`
+
+Creates a fast snapshot for a single package.
+
+Included by default:
+
+- target package data (all detected installed users unless constrained)
+- optional extra auth package data
+- account bundle (unless disabled)
+- per-package runtime permissions/appops metadata
+
+Usage:
+
+```bash
+python3 recovery_tool.py backup-app <package> [--name NAME] [--user USER ...] [--auth-pkg PKG ...] [--no-account-db]
+```
+
+Options:
+
+- `package` - required package id (example: `com.example.app`)
+- `--name NAME` - snapshot name
+- `--user USER` - repeatable, backup only selected users where package exists
+- `--auth-pkg PKG` - repeatable, include extra auth package data
+- `--no-account-db` - skip account bundle files
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose backup-app com.valuephone.vpnetto --name netto_fixed
+python3 recovery_tool.py backup-app com.example.app --user 0
+python3 recovery_tool.py backup-app com.example.app --user 0 --user 10
+python3 recovery_tool.py backup-app com.example.app --auth-pkg com.example.auth
+python3 recovery_tool.py backup-app com.example.app --no-account-db
+```
+
+### 4) `restore-path`
+
+Restores from a full snapshot (`backup`) with package scope filtering.
+
+Usage:
+
+```bash
+python3 recovery_tool.py restore-path <snapshot> [--pkg-scope {apps,all,system,thirdparty}]
+```
+
+Scope values:
+
+- `apps` (default): installed packages excluding overlays
+- `all`: all installed packages
+- `system`: system packages only
+- `thirdparty`: non-system packages only
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose restore-path zero
+python3 recovery_tool.py --verbose restore-path zero --pkg-scope apps
+python3 recovery_tool.py --verbose restore-path zero --pkg-scope all
+python3 recovery_tool.py --verbose restore-path zero --pkg-scope system
+python3 recovery_tool.py --verbose restore-path zero --pkg-scope thirdparty
+```
+
+### 5) `restore-app`
+
+Restores a snapshot created by `backup-app`.
+
+Usage:
+
+```bash
+python3 recovery_tool.py restore-app <snapshot> [--package PKG] [--user USER ...] [--auth-pkg PKG ...] [--with-account-db|--no-account-db]
+```
+
+Options:
+
+- `snapshot` - required snapshot name
+- `--package PKG` - override package from `app_snapshot.json`
+- `--user USER` - repeatable, restore to selected users
+- `--auth-pkg PKG` - repeatable, override auth packages
+- `--with-account-db` - force account DB restore
+- `--no-account-db` - skip account DB restore
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose restore-app netto_fixed
+python3 recovery_tool.py restore-app netto_fixed --package com.valuephone.vpnetto --user 0
+python3 recovery_tool.py restore-app netto_fixed --user 0 --user 10
+python3 recovery_tool.py restore-app netto_fixed --auth-pkg com.example.auth
+python3 recovery_tool.py restore-app netto_fixed --no-account-db
+python3 recovery_tool.py restore-app netto_fixed --with-account-db
+```
+
+### 6) `restore-thirdparty`
+
+Restores a snapshot created by `backup-thirdparty`.
+
+Usage:
+
+```bash
+python3 recovery_tool.py restore-thirdparty <snapshot> [--user USER ...] [--auth-pkg PKG ...]
+```
+
+Options:
+
+- `snapshot` - required snapshot name
+- `--user USER` - repeatable, limit restore to selected users
+- `--auth-pkg PKG` - repeatable, override auth packages for restore
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose restore-thirdparty zero3party
+python3 recovery_tool.py restore-thirdparty zero3party --user 0
+python3 recovery_tool.py restore-thirdparty zero3party --user 0 --user 10
+python3 recovery_tool.py restore-thirdparty zero3party --auth-pkg com.example.auth
+```
+
+## Snapshot Layout
+
+Snapshots are created under:
+
+- `snapshots/<snapshot-name>/`
+
+Common files:
+
+- `data.tar.zst` - compressed archive
+- `logs/` - command logs (when generated)
+
+Metadata files by snapshot type:
+
+- `backup-app` snapshots: `app_snapshot.json`
+- `backup-thirdparty` snapshots: `apps_snapshot.json`
+- full backup snapshots may include: `snapshot_state.json`
+
+## Common Workflows
+
+### A) Full device `/data` backup and restore
+
+```bash
+python3 recovery_tool.py --verbose backup --name zero
+python3 recovery_tool.py --verbose restore-path zero --pkg-scope all
+```
+
+### B) Single app backup and restore
+
+```bash
+python3 recovery_tool.py --verbose backup-app com.example.app --name app_snap
+python3 recovery_tool.py --verbose restore-app app_snap
+```
+
+### C) All users' third-party apps backup and restore
+
+```bash
+python3 recovery_tool.py --verbose backup-thirdparty --name tp_all
+python3 recovery_tool.py --verbose restore-thirdparty tp_all
+```
+
+## Help Commands
+
+```bash
+python3 recovery_tool.py -h
+python3 recovery_tool.py backup -h
+python3 recovery_tool.py backup-thirdparty -h
+python3 recovery_tool.py backup-app -h
+python3 recovery_tool.py restore-path -h
+python3 recovery_tool.py restore-app -h
+python3 recovery_tool.py restore-thirdparty -h
+```
+
+## Troubleshooting Quick Checks
+
+ADB/device:
+
+```bash
+adb devices
+adb shell su -c id
+```
+
+Crash logs:
 
 ```bash
 adb logcat -b crash -d | tail -n 200
 ```
 
-Filter for Photos / MediaProvider:
+Tool logs:
 
 ```bash
-adb logcat -d | grep -iE "photos|MediaProvider|providers\.media|media_store" | tail -n 200
+ls -la snapshots/<snapshot>/logs/
+tail -n 200 snapshots/<snapshot>/logs/*.log
 ```
-
-Save logs to files (recommended when reporting issues):
-
-```bash
-adb logcat -b crash -d > crash.log
-adb logcat -d > full.log
-```
-
----
-
-## Common troubleshooting
-
-### `adb: no devices/emulators found`
-
-Check:
-
-```bash
-adb devices
-```
-
-Then:
-
-- reconnect the cable
-- ensure **USB debugging** is enabled
-
-### Device shows `unauthorized`
-
-```bash
-adb kill-server
-adb start-server
-adb devices
-```
-
-Then accept the prompt on the phone.
-
-### Root not working (`su` fails)
-
-```bash
-adb shell su -c id
-```
-
-If this fails, the tool cannot work.
-
----
-
-## Recommended workflow
-
-1. Install host dependencies (`adb`, `zstd`, `tar`, `python3`)
-2. Connect phone and verify:
-
-   ```bash
-   adb devices
-   adb shell su -c id
-   ```
-
-3. Create a snapshot:
-
-   ```bash
-   python3 recovery_tool.py backup --name initial
-   ```
-
-4. Restore when needed:
-
-   ```bash
-   python3 recovery_tool.py restore-path initial --pkg-scope apps
-   ```
-
-5. Optionally reboot once:
-
-   ```bash
-   adb reboot
-   ```
