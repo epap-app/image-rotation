@@ -12,10 +12,12 @@ from .tar_index import TarIndex
 @dataclass(frozen=True)
 class ExecConfig:
     chunk_size: int = 120
+    runtime_state_batch_size_path: int = 24
+    runtime_state_batch_size_app: int = 0
 
 
 class RestoreExecutor:
-    def __init__(self, adb: AdbClient, logger: logging.Logger, exec_cfg: ExecConfig):
+    def __init__(self, adb: "AdbClient", logger: logging.Logger, exec_cfg: ExecConfig):
         self.adb = adb
         self.logger = logger
         self.cfg = exec_cfg
@@ -42,177 +44,19 @@ class RestoreExecutor:
 
     @staticmethod
     def _is_media_root_allow_empty(p: str) -> bool:
-        # Allow empty DCIM/Pictures (snapshot may intentionally have none)
         return bool(__import__("re").match(r"^data/media/\d+/(DCIM|Pictures)$", p))
 
-    def _check_adb_connection(self) -> None:
-        """Check ADB connection health before large file transfers."""
-        import subprocess
-        
-        self.logger.info("Checking ADB connection health...")
-        
-        # Check ADB version
-        try:
-            result = subprocess.run(["adb", "version"], capture_output=True, text=True, check=False)
-            if result.returncode == 0:
-                version_line = result.stdout.split('\n')[0] if result.stdout else "unknown"
-                self.logger.info("ADB version: %s", version_line.strip())
-        except Exception as e:
-            self.logger.warning("Could not check ADB version: %s", e)
-        
-        # Check device connection
-        try:
-            devices_result = self.adb.adb(["devices", "-l"], check=False)
-            self.logger.info("Connected devices:\n%s", devices_result.stdout.strip())
-        except Exception as e:
-            self.logger.warning("Could not list devices: %s", e)
-        
-        # Check USB connection speed if available
-        try:
-            usb_speed = self.adb.shell_root("getprop sys.usb.config", check=False)
-            if usb_speed.stdout.strip():
-                self.logger.info("USB config: %s", usb_speed.stdout.strip())
-        except Exception as e:
-            self.logger.warning("Could not check USB config: %s", e)
+    @staticmethod
+    def _build_pkg_roots(uid: int, pkg: str) -> list[str]:
+        return [
+            f"data/user/{uid}/{pkg}",
+            f"data/user_de/{uid}/{pkg}",
+            f"data/media/{uid}/Android/data/{pkg}",
+            f"data/media/{uid}/Android/media/{pkg}",
+            f"data/media/{uid}/Android/obb/{pkg}",
+        ]
 
-    def _push_with_verification(self, local_path: str, device_path: str, max_retries: int = 3) -> None:
-        """
-        Push a file to device with verification fallback for large files.
-        Handles the 'failed to read copy response' ADB bug and disk space issues.
-        """
-        import os
-        import re
-        import subprocess
-        import time
-        
-        # Get local file size for verification
-        local_size = os.path.getsize(local_path)
-        self.logger.info("Local file size: %d bytes (%.2f GB)", local_size, local_size / (1024**3))
-        
-        # Check ADB connection health before large transfers
-        if local_size > 100 * 1024**2:  # > 100MB
-            self._check_adb_connection()
-        
-        # Check available space on device before pushing
-        df_result = self.adb.shell_root("df /data/local/tmp | tail -1 | awk '{print $4}'", check=False)
-        try:
-            # Available space in KB (from df output)
-            available_kb = int(df_result.stdout.strip())
-            available_bytes = available_kb * 1024
-            self.logger.info("Device available space: %.2f GB", available_bytes / (1024**3))
-            
-            # Require at least 1.2x file size for safety (buffer + overhead)
-            required_bytes = int(local_size * 1.2)
-            if available_bytes < required_bytes:
-                raise RuntimeError(
-                    f"Insufficient space on device: need {required_bytes/(1024**3):.2f}GB, "
-                    f"have {available_bytes/(1024**3):.2f}GB"
-                )
-        except (ValueError, AttributeError) as e:
-            self.logger.warning("Could not check available space: %s", e)
-        
-        # Try push with retries
-        last_exception = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                self.logger.info("Push attempt %d/%d...", attempt, max_retries)
-                
-                # For large files, restart ADB server before each attempt to avoid stale connections
-                if attempt > 1 and local_size > 1024**3:  # > 1GB
-                    self.logger.info("Restarting ADB server to clear stale connections...")
-                    subprocess.run(["adb", "kill-server"], check=False, capture_output=True)
-                    time.sleep(2)
-                    subprocess.run(["adb", "start-server"], check=False, capture_output=True)
-                    time.sleep(3)
-                
-                # Try normal push with check=True
-                self.adb.adb(["push", str(local_path), device_path], check=True)
-                self.logger.info("Push completed successfully")
-                return
-                
-            except subprocess.CalledProcessError as e:
-                last_exception = e
-                
-                # Log the full error details for diagnosis
-                self.logger.error("ADB push failed on attempt %d with exit code %d", attempt, e.returncode)
-                self.logger.error("Command: %s", e.cmd)
-                if e.stdout:
-                    self.logger.error("stdout: %s", e.stdout)
-                if e.stderr:
-                    self.logger.error("stderr: %s", e.stderr)
-                
-                # Check if this is the "failed to read copy response" error
-                stderr = e.stderr or ""
-                
-                # Look for successful transfer indicators in stderr
-                # Format: "X file pushed, Y skipped. Z MB/s (BYTES bytes in TIME)"
-                transfer_pattern = r"(\d+)\s+file\s+pushed.*?\((\d+)\s+bytes\s+in\s+[\d.]+s\)"
-                match = re.search(transfer_pattern, stderr)
-                
-                if match and "failed to read copy response" in stderr:
-                    files_pushed = int(match.group(1))
-                    bytes_transferred = int(match.group(2))
-                    
-                    self.logger.warning("ADB push returned error but reports transfer completion:")
-                    self.logger.warning("  Files pushed: %d", files_pushed)
-                    self.logger.warning("  Bytes reported: %d (%.2f GB)", 
-                                      bytes_transferred, bytes_transferred / (1024**3))
-                    
-                    # Verify the file actually exists on device with correct size
-                    self.logger.info("Verifying file on device...")
-                    verify_result = self.adb.shell_root(
-                        f"[ -f {shlex.quote(device_path)} ] && stat -c '%s' {shlex.quote(device_path)} 2>/dev/null || echo 0",
-                        check=False
-                    )
-                    
-                    try:
-                        device_size = int(verify_result.stdout.strip())
-                    except (ValueError, AttributeError):
-                        device_size = 0
-                    
-                    self.logger.info("Device file size: %d bytes (%.2f GB)", device_size, device_size / (1024**3))
-                    
-                    if device_size == local_size:
-                        self.logger.info("File verified: device size matches local file")
-                        return
-                    elif device_size == bytes_transferred:
-                        self.logger.info("File verified: device size matches ADB report")
-                        return
-                    elif device_size > 0 and abs(device_size - local_size) < 1024:
-                        self.logger.info("Size difference within tolerance, proceeding")
-                        return
-                    else:
-                        # Incomplete transfer
-                        completion_pct = (device_size / local_size) * 100 if local_size > 0 else 0
-                        self.logger.error("Incomplete transfer: %.1f%% complete (%d/%d bytes)",
-                                        completion_pct, device_size, local_size)
-                        
-                        # Clean up partial file before retry
-                        self.logger.info("Removing incomplete file from device...")
-                        self.adb.shell_root(f"rm -f {shlex.quote(device_path)}", check=False)
-                        
-                        if attempt < max_retries:
-                            self.logger.info("Retrying after incomplete transfer...")
-                            time.sleep(5)
-                            continue
-                        else:
-                            raise RuntimeError(
-                                f"Push failed after {max_retries} attempts: only {device_size/(1024**3):.2f}GB of "
-                                f"{local_size/(1024**3):.2f}GB transferred ({completion_pct:.1f}%)"
-                            )
-                else:
-                    # Different error or no transfer pattern found
-                    if attempt < max_retries:
-                        self.logger.warning("Retrying after %d seconds...", 5 * attempt)
-                        time.sleep(5 * attempt)
-                    else:
-                        raise
-        
-        # If we've exhausted all retries, raise the last exception
-        if last_exception:
-            raise last_exception
-
-    def _safe_media_refresh(self, plan: RestorePlan) -> None:
+    def _safe_media_refresh(self, plan: "RestorePlan") -> None:
         self.logger.info("Post-restore: safe media refresh (Android 13) ...")
         lines = ["su", "set -e", ""]
 
@@ -240,98 +84,284 @@ class RestoreExecutor:
         ]
         self.adb.shell_script("\n".join(lines), allow_fail=True)
 
-    def exec_restore_path(self, plan: RestorePlan, tar_index: TarIndex, local_tar, device_tar: str = "/data/local/tmp/restore.tar") -> None:
-        import time
-        import os
-        
+    def _stop_framework_best_effort(self) -> None:
+        self.logger.info("Stopping framework (best-effort) ...")
+        self.adb.shell_script(
+            "su\n"
+            "if command -v stop >/dev/null 2>&1; then stop; "
+            "elif command -v setprop >/dev/null 2>&1; then "
+            "setprop ctl.stop zygote 2>/dev/null || true; "
+            "setprop ctl.stop zygote_secondary 2>/dev/null || true; "
+            "fi\n"
+            "exit\nexit\n",
+            allow_fail=True,
+        )
+
+    def _start_framework_best_effort(self) -> None:
+        self.logger.info("Starting framework (best-effort) ...")
+        self.adb.shell_script(
+            "su\n"
+            "if command -v start >/dev/null 2>&1; then start; "
+            "elif command -v setprop >/dev/null 2>&1; then "
+            "setprop ctl.start zygote 2>/dev/null || true; "
+            "setprop ctl.start zygote_secondary 2>/dev/null || true; "
+            "fi\n"
+            "sleep 2\n"
+            "exit\nexit\n",
+            allow_fail=True,
+        )
+
+    def _apply_runtime_state(
+        self,
+        runtime_state: dict,
+        package_batch_size: int = 1,
+        apply_revokes: bool = False,
+    ) -> None:
+        if not runtime_state:
+            return
+        packages = [(pkg, user_map) for pkg, user_map in runtime_state.items() if isinstance(pkg, str) and isinstance(user_map, dict)]
+        if not packages:
+            return
+
+        total = len(packages)
+        if package_batch_size <= 0 or package_batch_size > total:
+            package_batch_size = total
+        total_batches = (total + package_batch_size - 1) // package_batch_size
+        self.logger.info(
+            "Applying package runtime state (permissions/appops): %d packages in %d batch(es) ...",
+            total,
+            total_batches,
+        )
+
+        for batch_i, start in enumerate(range(0, total, package_batch_size), start=1):
+            chunk = packages[start:start + package_batch_size]
+            lines = ["su", "set +e", ""]
+
+            for idx, (pkg, user_map) in enumerate(chunk, start=start + 1):
+                lines.append(f"# pkg {idx}/{total}: {pkg}")
+                for uid_s, state in user_map.items():
+                    try:
+                        uid = int(uid_s)
+                    except Exception:
+                        continue
+                    if not isinstance(state, dict):
+                        continue
+
+                    lines.append(f"am force-stop --user {uid} {shlex.quote(pkg)} >/dev/null 2>&1 || true")
+
+                    perms = state.get("runtime_permissions")
+                    if isinstance(perms, dict):
+                        for perm, granted in perms.items():
+                            if not isinstance(perm, str):
+                                continue
+                            if isinstance(granted, bool):
+                                if granted:
+                                    lines.append(
+                                        f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
+                                    )
+                                elif apply_revokes:
+                                    lines.append(
+                                        f"pm revoke --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
+                                    )
+                            elif granted:
+                                lines.append(
+                                    f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
+                                )
+                    elif isinstance(perms, list):
+                        for perm in perms:
+                            if not isinstance(perm, str):
+                                continue
+                            lines.append(
+                                f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
+                            )
+
+                    appops = state.get("appops")
+                    if isinstance(appops, dict):
+                        for op, mode in appops.items():
+                            if not isinstance(op, str) or not isinstance(mode, str):
+                                continue
+                            if mode.lower() == "default":
+                                continue
+                            lines.append(
+                                f"cmd appops set --user {uid} {shlex.quote(pkg)} {shlex.quote(op)} {shlex.quote(mode)} "
+                                ">/dev/null 2>&1 || true"
+                            )
+
+            lines += ["exit", "exit", ""]
+            self.logger.info(
+                "Applying runtime state batch %d/%d (%d packages) ...",
+                batch_i,
+                total_batches,
+                len(chunk),
+            )
+            self.adb.shell_script("\n".join(lines), allow_fail=True)
+
+    def _permission_state_file_fixups(self, user_ids: list[int]) -> None:
+        self.logger.info("Post-restore: permission state file fixups ...")
+        lines = ["su", "cd /", ""]
+
+        lines += [
+            "if [ -f /data/system/appops.xml ]; then",
+            "  chown system:system /data/system/appops.xml >/dev/null 2>&1 || true",
+            "  chmod 600 /data/system/appops.xml >/dev/null 2>&1 || true",
+            "  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system/appops.xml >/dev/null 2>&1 || true; fi",
+            "fi",
+            "",
+        ]
+
+        for uid in user_ids:
+            lines += [
+                f"if [ -f /data/system/users/{uid}/runtime-permissions.xml ]; then",
+                f"  chown system:system /data/system/users/{uid}/runtime-permissions.xml >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/system/users/{uid}/runtime-permissions.xml >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system/users/{uid}/runtime-permissions.xml >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+                f"if [ -f /data/system/users/{uid}/package-restrictions.xml ]; then",
+                f"  chown system:system /data/system/users/{uid}/package-restrictions.xml >/dev/null 2>&1 || true",
+                f"  chmod 660 /data/system/users/{uid}/package-restrictions.xml >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system/users/{uid}/package-restrictions.xml >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+                # Android 13+ permission module storage.
+                f"if [ -f /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml ]; then",
+                f"  chown system:system /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+                f"if [ -f /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml.reservecopy ]; then",
+                f"  chown system:system /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml.reservecopy >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml.reservecopy >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/misc_de/{uid}/apexdata/com.android.permission/runtime-permissions.xml.reservecopy >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+                f"if [ -f /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml ]; then",
+                f"  chown system:system /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+                f"if [ -f /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml.reservecopy ]; then",
+                f"  chown system:system /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml.reservecopy >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml.reservecopy >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/misc_de/{uid}/apexdata/com.android.permission/roles.xml.reservecopy >/dev/null 2>&1 || true; fi",
+                "fi",
+                "",
+            ]
+
+        lines += [
+            "if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/system/users >/dev/null 2>&1 || true; fi",
+            "if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/system/appops >/dev/null 2>&1 || true; fi",
+            "if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/misc_de >/dev/null 2>&1 || true; fi",
+            "sync",
+            "exit",
+            "exit",
+            "",
+        ]
+        self.adb.shell_script("\n".join(lines), allow_fail=True)
+
+    # ---------------- NEW: keystore2 + locksettings fixups ----------------
+    def _keystore_locksettings_fixups(self, device_tar: str) -> None:
+        """
+        If snapshot contains keystore2 + locksettings, restore them in a safe order:
+        - stop keystore2 (best-effort)
+        - replace /data/misc/keystore from tar (dir)
+        - replace /data/system/locksettings.db* from tar
+        - restorecon + perms/owners
+        - start keystore2 (best-effort)
+
+        This helps when accounts/app tokens are encrypted with keystore-backed material.
+        """
+        self.logger.info("Post-restore: Keystore2 + locksettings replace + fixups ...")
+
+        dt = shlex.quote(device_tar)
+
+        lines = ["su", "cd /", ""]
+
+        # Helper: stop/start keystore2 best-effort.
+        lines += [
+            "# Stop keystore2 so we can safely replace its DB (best-effort)",
+            "if command -v stop >/dev/null 2>&1; then",
+            "  stop keystore2 >/dev/null 2>&1 || true",
+            "  stop credstore >/dev/null 2>&1 || true",
+            "fi",
+            "if command -v setprop >/dev/null 2>&1; then",
+            "  setprop ctl.stop keystore2 >/dev/null 2>&1 || true",
+            "  setprop ctl.stop credstore >/dev/null 2>&1 || true",
+            "fi",
+            "sleep 0.5",
+            "",
+        ]
+
+        # Restore /data/misc/keystore (directory) if present in tar.
+        # We anchor on persistent.sqlite, but extract the whole directory for completeness.
+        lines += [
+            f"if tar -tf {dt} data/misc/keystore/persistent.sqlite >/dev/null 2>&1; then",
+            "  # Clear existing dir contents then extract snapshot version",
+            "  mkdir -p /data/misc/keystore >/dev/null 2>&1 || true",
+            "  rm -f /data/misc/keystore/* >/dev/null 2>&1 || true",
+            f"  tar -xpf {dt} data/misc/keystore >/dev/null 2>&1 || true",
+            "  chown -R keystore:keystore /data/misc/keystore >/dev/null 2>&1 || true",
+            "  chmod 700 /data/misc/keystore >/dev/null 2>&1 || true",
+            "  chmod 600 /data/misc/keystore/* >/dev/null 2>&1 || true",
+            "  if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/misc/keystore >/dev/null 2>&1 || true; fi",
+            "fi",
+            "",
+        ]
+
+        # Restore /data/system/locksettings.db* if present in tar
+        # (we probe each file before extracting to avoid tar errors for missing members)
+        lines += [
+            "LS_LIST=''",
+            f"for f in data/system/locksettings.db data/system/locksettings.db-wal data/system/locksettings.db-shm data/system/locksettings.db-journal; do",
+            f"  if tar -tf {dt} \"$f\" >/dev/null 2>&1; then LS_LIST=\"$LS_LIST $f\"; fi",
+            "done",
+            "if [ -n \"$LS_LIST\" ]; then",
+            "  rm -f /data/system/locksettings.db* >/dev/null 2>&1 || true",
+            f"  tar -xpf {dt} $LS_LIST >/dev/null 2>&1 || true",
+            "  chown system:system /data/system/locksettings.db* >/dev/null 2>&1 || true",
+            "  chmod 600 /data/system/locksettings.db* >/dev/null 2>&1 || true",
+            "  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system/locksettings.db* >/dev/null 2>&1 || true; fi",
+            "fi",
+            "",
+        ]
+
+        # Start keystore2 back (best-effort)
+        lines += [
+            "sync",
+            "# Start keystore2 back (best-effort)",
+            "if command -v start >/dev/null 2>&1; then",
+            "  start keystore2 >/dev/null 2>&1 || true",
+            "  start credstore >/dev/null 2>&1 || true",
+            "fi",
+            "if command -v setprop >/dev/null 2>&1; then",
+            "  setprop ctl.start keystore2 >/dev/null 2>&1 || true",
+            "  setprop ctl.start credstore >/dev/null 2>&1 || true",
+            "fi",
+            "sleep 0.5",
+            "",
+            "exit",
+            "exit",
+            "",
+        ]
+
+        self.adb.shell_script("\n".join(lines), allow_fail=True)
+
+    def exec_restore_path(
+        self,
+        plan: "RestorePlan",
+        tar_index: "TarIndex",
+        local_tar,
+        runtime_state: dict | None = None,
+        device_tar: str = "/data/local/tmp/restore.tar",
+    ) -> None:
         ch = self.cfg.chunk_size
-        overall_start = time.time()
 
-        # Clean up old tar files to ensure sufficient space
-        self.logger.info("Cleaning up old tar files on device...")
-        cleanup_start = time.time()
-        self.adb.shell_root(f"rm -f {shlex.quote(device_tar)} /data/local/tmp/*.tar /data/local/tmp/restore.tar.part* 2>/dev/null || true", check=False)
-        cleanup_elapsed = time.time() - cleanup_start
-        self.logger.info("Cleanup time: %.2f seconds", cleanup_elapsed)
-        
-        # Check file size and split if > 10GB to work around 16GB ADB transfer limit
-        local_tar_path = str(local_tar)
-        file_size = os.path.getsize(local_tar_path)
-        size_gb = file_size / (1024**3)
-        
-        if file_size > 10 * (1024**3):  # > 10GB
-            self.logger.info("Large file detected (%.2f GB) - splitting to work around 16GB ADB limit", size_gb)
-            
-            # Split into 8GB chunks to stay well under 16GB limit
-            chunk_size = 8 * (1024**3)
-            chunks = []
-            chunk_num = 0
-            total_push_time = 0
-            total_read_write_time = 0
-            
-            with open(local_tar_path, 'rb') as f:
-                while True:
-                    chunk_num += 1
-                    chunk_local = f"{local_tar_path}.part{chunk_num:03d}"
-                    chunk_device = f"{device_tar}.part{chunk_num:03d}"
-                    
-                    # Time reading and writing chunk
-                    rw_start = time.time()
-                    self.logger.info("Reading chunk %d from tar...", chunk_num)
-                    data = f.read(chunk_size)
-                    if not data:
-                        break
-                    
-                    # Write chunk locally
-                    with open(chunk_local, 'wb') as chunk_file:
-                        chunk_file.write(data)
-                    rw_elapsed = time.time() - rw_start
-                    total_read_write_time += rw_elapsed
-                    
-                    chunk_mb = len(data) / (1024**2)
-                    chunk_gb = len(data) / (1024**3)
-                    self.logger.info("Chunk %d read/write: %.2f seconds (%.2f GB)", chunk_num, rw_elapsed, chunk_gb)
-                    
-                    # Time the push
-                    push_start = time.time()
-                    self.logger.info("Pushing chunk %d (%.0f MB) to device...", chunk_num, chunk_mb)
-                    self.adb.adb(["push", chunk_local, chunk_device], check=True)
-                    push_elapsed = time.time() - push_start
-                    total_push_time += push_elapsed
-                    
-                    push_speed_mbps = chunk_mb / push_elapsed if push_elapsed > 0 else 0
-                    self.logger.info("Chunk %d push: %.2f seconds (%.2f MB/s)", chunk_num, push_elapsed, push_speed_mbps)
-                    
-                    # Clean up local chunk
-                    os.unlink(chunk_local)
-                    chunks.append(chunk_device)
-            
-            self.logger.info("Total chunks: %d", len(chunks))
-            self.logger.info("Total read/write time: %.2f seconds (%.2f minutes)", total_read_write_time, total_read_write_time / 60)
-            self.logger.info("Total push time: %.2f seconds (%.2f minutes)", total_push_time, total_push_time / 60)
-            self.logger.info("Average push speed: %.2f MB/s", (size_gb * 1024) / total_push_time if total_push_time > 0 else 0)
-            
-            # Time reassembly
-            reassembly_start = time.time()
-            self.logger.info("Reassembling %d chunks on device...", len(chunks))
-            parts_pattern = f"{device_tar}.part*"
-            cat_cmd = f"cd /data/local/tmp && cat {parts_pattern} > {shlex.quote(device_tar)} && rm {parts_pattern}"
-            self.adb.shell_root(cat_cmd, check=True)
-            reassembly_elapsed = time.time() - reassembly_start
-            self.logger.info("Reassembly time: %.2f seconds (%.2f GB)", reassembly_elapsed, size_gb)
-        else:
-            # Time single push for smaller files
-            push_start = time.time()
-            self.logger.info("Pushing tar to device (%.2f GB)...", size_gb)
-            self.adb.adb(["push", local_tar_path, device_tar], check=True)
-            push_elapsed = time.time() - push_start
-            push_speed_mbps = (size_gb * 1024) / push_elapsed if push_elapsed > 0 else 0
-            self.logger.info("Push time: %.2f seconds (%.2f MB/s)", push_elapsed, push_speed_mbps)
-        
-        transfer_total = time.time() - overall_start
-        self.logger.info("Total transfer phase: %.2f seconds (%.2f minutes)", transfer_total, transfer_total / 60)
+        self.logger.info("Pushing temp tar to device...")
+        self.adb.adb(["push", str(local_tar), device_tar], check=True)
 
-        # ---------------- Stage 1: media/files first (fixed for empty DCIM/Pictures) ----------------
+        # ---------------- Stage 1: media/files first ----------------
         media_bak_map = "/data/local/tmp/media_bak_map.txt"
         if plan.media_paths:
             self.logger.info("Stage 1/2: Restoring files/media FIRST... (%d paths)", len(plan.media_paths))
@@ -343,7 +373,6 @@ class RestoreExecutor:
             prep_lines = []
             map_lines = []
 
-            # map lines: ROOT|BAK|EXPECTFILES(0/1)
             for p in chunk_paths:
                 parsed = self._parse_uid_pkg_from_path(p)
                 if parsed:
@@ -352,8 +381,6 @@ class RestoreExecutor:
 
                 root_abs = "/" + p
                 bak_abs = root_abs + ".bak_restore6"
-
-                # FIX: DCIM/Pictures may be intentionally empty in snapshot => EXPECT=0
                 expect = "0" if self._is_media_root_allow_empty(p) else "1"
                 map_lines.append(f"{root_abs}|{bak_abs}|{expect}")
 
@@ -372,17 +399,14 @@ if [ -f {shlex.quote(media_bak_map)} ]; then
   while IFS='|' read -r ROOT BAK EXPECT; do
     [ -z "$ROOT" ] && continue
 
-    # backup existing dir
     if [ -e "$ROOT" ]; then
       rm -rf "$BAK" >/dev/null 2>&1 || true
       mv "$ROOT" "$BAK" >/dev/null 2>&1 || true
     fi
 
-    # extract this root (may be empty, e.g. DCIM/Pictures)
     tar -xpf {device_tar} "${{ROOT#/}}" >/dev/null 2>&1 || true
 
     if [ "$EXPECT" = "1" ]; then
-      # must have at least one file; otherwise rollback
       if find "$ROOT" -type f -maxdepth 6 2>/dev/null | head -n 1 | grep -q .; then
         rm -rf "$BAK" >/dev/null 2>&1 || true
       else
@@ -392,7 +416,6 @@ if [ -f {shlex.quote(media_bak_map)} ]; then
         fi
       fi
     else
-      # EXPECT=0: empty is valid, but ROOT must at least exist; otherwise rollback
       if [ -e "$ROOT" ]; then
         rm -rf "$BAK" >/dev/null 2>&1 || true
       else
@@ -408,7 +431,7 @@ exit
 """
             self.adb.shell_script(script, allow_fail=True)
 
-        # ---------------- Stage 2: apps after files (EXACT recovery6.py) ----------------
+        # ---------------- Stage 2: apps after files ----------------
         if plan.app_paths:
             self.logger.info("Stage 2/2: Restoring apps AFTER files... (%d paths)", len(plan.app_paths))
 
@@ -429,14 +452,17 @@ exit
             lines += ["exit", "exit"]
             self.adb.shell_script("\n".join(lines) + "\n", allow_fail=True)
 
-        self.logger.info("Stopping framework (best-effort) ...")
-        self.adb.shell_script(
-            'su\n'
-            'if command -v stop >/dev/null 2>&1; then stop; '
-            'elif command -v setprop >/dev/null 2>&1; then setprop ctl.stop zygote 2>/dev/null || true; setprop ctl.stop zygote_secondary 2>/dev/null || true; fi\n'
-            'exit\nexit\n',
-            allow_fail=True,
-        )
+        # Replay runtime permissions/appops before framework stop/start so restore
+        # is not blocked by lock-screen state after restart.
+        if runtime_state:
+            self.logger.info("Pre-stage: applying runtime state before framework restart ...")
+            self._apply_runtime_state(
+                runtime_state,
+                package_batch_size=self.cfg.runtime_state_batch_size_path,
+                apply_revokes=False,
+            )
+
+        self._stop_framework_best_effort()
 
         for i in range(0, len(plan.app_paths), ch):
             chunk_paths = plan.app_paths[i:i + ch]
@@ -463,6 +489,13 @@ exit
 """
             self.adb.shell_script(script, allow_fail=True)
 
+        # NEW: restore keystore2 + locksettings (if present) BEFORE accounts DB replace
+        self._keystore_locksettings_fixups(device_tar)
+
+        # AccountManager DB replace + perms/contexts
+        self._accountmanager_fixups(plan.user_ids, device_tar)
+        self._permission_state_file_fixups(plan.user_ids)
+
         self.logger.info("Post-stage: restorecon + start framework (best-effort) ...")
         self.adb.shell_script(
             "su\nsync\n"
@@ -471,22 +504,17 @@ exit
             allow_fail=True,
         )
 
-        self.adb.shell_script(
-            'su\n'
-            'if command -v start >/dev/null 2>&1; then start; '
-            'elif command -v setprop >/dev/null 2>&1; then setprop ctl.start zygote 2>/dev/null || true; setprop ctl.start zygote_secondary 2>/dev/null 2>&1 || true; fi\n'
-            'sleep 2\n'
-            'exit\nexit\n',
-            allow_fail=True,
-        )
+        self._start_framework_best_effort()
 
         # Fixups (kept)
         fix_lines = ["su", "cd /"]
         for uid in plan.user_ids:
             fix_lines.append(f'chown -R media_rw:media_rw /data/media/{uid} >/dev/null 2>&1 || true')
-            fix_lines.append('if command -v restorecon >/dev/null 2>&1; then '
-                             f'restorecon -RF /data/media/{uid} >/dev/null 2>&1 || true; '
-                             'fi')
+            fix_lines.append(
+                'if command -v restorecon >/dev/null 2>&1; then '
+                f'restorecon -RF /data/media/{uid} >/dev/null 2>&1 || true; '
+                'fi'
+            )
             fix_lines.append(f'am force-stop --user {uid} com.android.providers.media >/dev/null 2>&1 || true')
             fix_lines.append(f'am force-stop --user {uid} com.google.android.apps.photos >/dev/null 2>&1 || true')
         fix_lines += ["exit", "exit"]
@@ -520,6 +548,162 @@ exit
         # Cleanup device tar
         self.adb.shell_root(f"rm -f {shlex.quote(device_tar)}", check=False)
 
+    def exec_restore_app(
+        self,
+        package: str,
+        user_ids: list[int],
+        local_tar,
+        auth_pkgs: list[str] | None = None,
+        include_account_db: bool = True,
+        present_roots: set[str] | None = None,
+        runtime_state: dict | None = None,
+        device_tar: str = "/data/local/tmp/restore-app.tar",
+    ) -> None:
+        if not user_ids:
+            self.logger.warning("No users supplied for app restore; nothing to do.")
+            return
+
+        pkgs: list[str] = []
+        seen = set()
+        for p in [package] + list(auth_pkgs or []):
+            if p and p not in seen:
+                seen.add(p)
+                pkgs.append(p)
+
+        app_paths: list[str] = []
+        for uid in user_ids:
+            for pkg in pkgs:
+                app_paths.extend(self._build_pkg_roots(uid, pkg))
+
+        if present_roots is not None:
+            app_paths = [p for p in app_paths if p in present_roots]
+        app_paths = list(dict.fromkeys(app_paths))
+
+        ch = self.cfg.chunk_size
+        self.logger.info(
+            "Restoring app snapshot: package=%s users=%s packages=%d roots=%d account_db=%s",
+            package,
+            ",".join(str(u) for u in user_ids),
+            len(pkgs),
+            len(app_paths),
+            include_account_db,
+        )
+        self.logger.info("Pushing temp tar to device...")
+        self.adb.adb(["push", str(local_tar), device_tar], check=True)
+
+        all_pairs = []
+        all_seen = set()
+        for p in app_paths:
+            parsed = self._parse_uid_pkg_from_path(p)
+            if parsed and parsed not in all_seen:
+                all_seen.add(parsed)
+                all_pairs.append(parsed)
+
+        if all_pairs:
+            force_lines = ["su"]
+            for uid, pkg in all_pairs:
+                force_lines.append(f'am force-stop --user {uid} {shlex.quote(pkg)} >/dev/null 2>&1 || true')
+            force_lines += ["exit", "exit"]
+            self.adb.shell_script("\n".join(force_lines) + "\n", allow_fail=True)
+        else:
+            self.logger.warning("No app data roots from snapshot match requested package/auth packages.")
+
+        if runtime_state:
+            self.logger.info("Pre-stage: applying runtime state before framework restart ...")
+            self._apply_runtime_state(
+                runtime_state,
+                package_batch_size=self.cfg.runtime_state_batch_size_app,
+                apply_revokes=True,
+            )
+
+        if include_account_db:
+            self._stop_framework_best_effort()
+
+        for i in range(0, len(app_paths), ch):
+            chunk_paths = app_paths[i:i + ch]
+            self.logger.info("App restore chunk %d (%d paths)...", i // ch + 1, len(chunk_paths))
+
+            unique_pairs = []
+            seen_pairs = set()
+            for p in chunk_paths:
+                parsed = self._parse_uid_pkg_from_path(p)
+                if parsed and parsed not in seen_pairs:
+                    seen_pairs.add(parsed)
+                    unique_pairs.append(parsed)
+
+            prep_lines = []
+            fix_owner_lines = []
+            fix_ctx_lines = []
+            owner_idx = 0
+            ctx_idx = 0
+            for uid2, pkg in unique_pairs:
+                owner_var = f"O{owner_idx}"
+                owner_idx += 1
+                ctx_var = f"C{ctx_idx}"
+                ctx_idx += 1
+                quoted_pkg = shlex.quote(pkg)
+                prep_lines += [
+                    # Capture current app UID:GID before deletion so restored files keep app ownership.
+                    f'{owner_var}="$(stat -c \'%u:%g\' /data/user/{uid2}/{quoted_pkg} 2>/dev/null || stat -c \'%u:%g\' /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null || true)"',
+                    f'if [ -z "${owner_var}" ] && [ -f /data/system/packages.list ]; then '
+                    f'{owner_var}="$(awk \'$1==\\"{pkg}\\" {{print $2 ":" $2; exit}}\' /data/system/packages.list 2>/dev/null || true)"; fi',
+                    # Capture current SELinux app-data label (includes category set on most builds).
+                    f'{ctx_var}="$(ls -Zd /data/user/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || ls -Zd /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || true)"',
+                    f'rm -rf /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'rm -rf /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'rm -rf /data/media/{uid2}/Android/data/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'rm -rf /data/media/{uid2}/Android/media/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'rm -rf /data/media/{uid2}/Android/obb/{quoted_pkg} >/dev/null 2>&1 || true',
+                ]
+                fix_owner_lines += [
+                    f'if [ -n "${owner_var}" ]; then',
+                    f'  chown -R "${owner_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'  chown -R "${owner_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'fi',
+                ]
+                fix_ctx_lines += [
+                    f'if [ -n "${ctx_var}" ] && command -v chcon >/dev/null 2>&1; then',
+                    f'  chcon -R "${ctx_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'  chcon -R "${ctx_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                    f'fi',
+                ]
+
+            joined = " ".join(shlex.quote(p) for p in chunk_paths)
+            script = f"""
+su
+cd /
+{chr(10).join(prep_lines)}
+tar -xpf {device_tar} {joined} >/dev/null 2>&1 || true
+{chr(10).join(fix_owner_lines)}
+{chr(10).join(fix_ctx_lines)}
+exit
+exit
+"""
+            self.adb.shell_script(script, allow_fail=True)
+
+        if include_account_db:
+            self._keystore_locksettings_fixups(device_tar)
+            self._accountmanager_fixups(user_ids, device_tar)
+
+        restorecon_lines = ["su", "sync"]
+        restorecon_lines.append("if command -v restorecon >/dev/null 2>&1; then")
+        for uid in user_ids:
+            for pkg in pkgs:
+                restorecon_lines += [
+                    f'  restorecon -RF /data/user/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                    f'  restorecon -RF /data/user_de/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                    f'  restorecon -RF /data/media/{uid}/Android/data/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                    f'  restorecon -RF /data/media/{uid}/Android/media/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                    f'  restorecon -RF /data/media/{uid}/Android/obb/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                ]
+        restorecon_lines += ["fi", "exit", "exit", ""]
+        self.adb.shell_script("\n".join(restorecon_lines), allow_fail=True)
+
+        if include_account_db:
+            self._start_framework_best_effort()
+
+        self.adb.shell_root(f"rm -f {shlex.quote(device_tar)}", check=False)
+
     def exec_restore_full(self, device_tar: str) -> None:
         script = f"""
 su
@@ -529,3 +713,51 @@ exit
 exit
 """
         self.adb.shell_script(script, allow_fail=True)
+
+    def _accountmanager_fixups(self, user_ids: list[int], device_tar: str) -> None:
+        """
+        AccountManager support:
+        Replace AccountManager DBs from backup tar and ensure correct owner/perms/SELinux context.
+
+        Required files (per user in tar):
+        data/system_ce/<uid>/accounts_ce.db*
+        data/system_de/<uid>/accounts_de.db*
+        """
+        self.logger.info("Post-restore: AccountManager DB replace + fixups ...")
+        dt = shlex.quote(device_tar)
+
+        lines = ["su", "cd /", ""]
+
+        for uid in user_ids:
+            lines += [
+                f"if tar -tf {dt} data/system_ce/{uid}/accounts_ce.db >/dev/null 2>&1; then",
+                f"  rm -f /data/system_ce/{uid}/accounts_ce.db* >/dev/null 2>&1 || true",
+                f"  tar -xpf {dt} "
+                f"data/system_ce/{uid}/accounts_ce.db "
+                f"data/system_ce/{uid}/accounts_ce.db-wal "
+                f"data/system_ce/{uid}/accounts_ce.db-shm "
+                f">/dev/null 2>&1 || true",
+                f"  chown system:system /data/system_ce/{uid}/accounts_ce.db* >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/system_ce/{uid}/accounts_ce.db* >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system_ce/{uid}/accounts_ce.db* >/dev/null 2>&1 || true; fi",
+                f"fi",
+                "",
+            ]
+
+            lines += [
+                f"if tar -tf {dt} data/system_de/{uid}/accounts_de.db >/dev/null 2>&1; then",
+                f"  rm -f /data/system_de/{uid}/accounts_de.db* >/dev/null 2>&1 || true",
+                f"  tar -xpf {dt} "
+                f"data/system_de/{uid}/accounts_de.db "
+                f"data/system_de/{uid}/accounts_de.db-wal "
+                f"data/system_de/{uid}/accounts_de.db-shm "
+                f">/dev/null 2>&1 || true",
+                f"  chown system:system /data/system_de/{uid}/accounts_de.db* >/dev/null 2>&1 || true",
+                f"  chmod 600 /data/system_de/{uid}/accounts_de.db* >/dev/null 2>&1 || true",
+                f"  if command -v restorecon >/dev/null 2>&1; then restorecon -v /data/system_de/{uid}/accounts_de.db* >/dev/null 2>&1 || true; fi",
+                f"fi",
+                "",
+            ]
+
+        lines += ["sync", "exit", "exit", ""]
+        self.adb.shell_script("\n".join(lines), allow_fail=True)
