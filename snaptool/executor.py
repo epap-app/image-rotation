@@ -14,6 +14,7 @@ class ExecConfig:
     chunk_size: int = 120
     runtime_state_batch_size_path: int = 24
     runtime_state_batch_size_app: int = 0
+    sdk_version: int | None = None
 
 
 class RestoreExecutor:
@@ -77,7 +78,6 @@ class RestoreExecutor:
             "fi",
             "",
             "monkey -p com.android.providers.media 1 >/dev/null 2>&1 || true",
-            f"monkey -p {shlex.quote(plan.photos_pkg)} 1 >/dev/null 2>&1 || true",
             "exit",
             "exit",
             "",
@@ -135,10 +135,14 @@ class RestoreExecutor:
 
         for batch_i, start in enumerate(range(0, total, package_batch_size), start=1):
             chunk = packages[start:start + package_batch_size]
-            lines = ["su", "set +e", ""]
-
+            self.logger.info(
+                "Applying runtime state batch %d/%d (%d packages) ...",
+                batch_i,
+                total_batches,
+                len(chunk),
+            )
             for idx, (pkg, user_map) in enumerate(chunk, start=start + 1):
-                lines.append(f"# pkg {idx}/{total}: {pkg}")
+                self.logger.info("Applying runtime state for package %d/%d: %s", idx, total, pkg)
                 for uid_s, state in user_map.items():
                     try:
                         uid = int(uid_s)
@@ -147,7 +151,9 @@ class RestoreExecutor:
                     if not isinstance(state, dict):
                         continue
 
-                    lines.append(f"am force-stop --user {uid} {shlex.quote(pkg)} >/dev/null 2>&1 || true")
+                    uid_s_arg = str(uid)
+                    self.adb.adb(["shell", "am", "force-stop", "--user", uid_s_arg, pkg], check=False)
+                    self.adb.adb(["shell", "cmd", "appops", "reset", "--user", uid_s_arg, pkg], check=False)
 
                     perms = state.get("runtime_permissions")
                     if isinstance(perms, dict):
@@ -156,45 +162,26 @@ class RestoreExecutor:
                                 continue
                             if isinstance(granted, bool):
                                 if granted:
-                                    lines.append(
-                                        f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
-                                    )
+                                    self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
                                 elif apply_revokes:
-                                    lines.append(
-                                        f"pm revoke --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
-                                    )
+                                    self.adb.adb(["shell", "pm", "revoke", "--user", uid_s_arg, pkg, perm], check=False)
                             elif granted:
-                                lines.append(
-                                    f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
-                                )
+                                self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
                     elif isinstance(perms, list):
                         for perm in perms:
                             if not isinstance(perm, str):
                                 continue
-                            lines.append(
-                                f"pm grant --user {uid} {shlex.quote(pkg)} {shlex.quote(perm)} >/dev/null 2>&1 || true"
-                            )
+                            self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
 
                     appops = state.get("appops")
                     if isinstance(appops, dict):
                         for op, mode in appops.items():
                             if not isinstance(op, str) or not isinstance(mode, str):
                                 continue
-                            if mode.lower() == "default":
-                                continue
-                            lines.append(
-                                f"cmd appops set --user {uid} {shlex.quote(pkg)} {shlex.quote(op)} {shlex.quote(mode)} "
-                                ">/dev/null 2>&1 || true"
+                            self.adb.adb(
+                                ["shell", "cmd", "appops", "set", "--user", uid_s_arg, pkg, op, mode],
+                                check=False,
                             )
-
-            lines += ["exit", "exit", ""]
-            self.logger.info(
-                "Applying runtime state batch %d/%d (%d packages) ...",
-                batch_i,
-                total_batches,
-                len(chunk),
-            )
-            self.adb.shell_script("\n".join(lines), allow_fail=True)
 
     def _permission_state_file_fixups(self, user_ids: list[int]) -> None:
         self.logger.info("Post-restore: permission state file fixups ...")
@@ -273,6 +260,20 @@ class RestoreExecutor:
 
         This helps when accounts/app tokens are encrypted with keystore-backed material.
         """
+        if self.cfg.sdk_version is None:
+            self.logger.warning(
+                "SDK version could not be determined; skipping keystore/locksettings "
+                "restore for safety (fail closed)."
+            )
+            return
+        if self.cfg.sdk_version >= 34:
+            self.logger.info(
+                "Skipping keystore/locksettings restore: Android 14+ (SDK %d) "
+                "hardware-bound keys are not portable across device/boot sessions.",
+                self.cfg.sdk_version,
+            )
+            return
+
         self.logger.info("Post-restore: Keystore2 + locksettings replace + fixups ...")
 
         dt = shlex.quote(device_tar)
@@ -354,6 +355,7 @@ class RestoreExecutor:
         tar_index: "TarIndex",
         local_tar,
         runtime_state: dict | None = None,
+        runtime_apply_revokes: bool = False,
         device_tar: str = "/data/local/tmp/restore.tar",
     ) -> None:
         ch = self.cfg.chunk_size
@@ -459,7 +461,7 @@ exit
             self._apply_runtime_state(
                 runtime_state,
                 package_batch_size=self.cfg.runtime_state_batch_size_path,
-                apply_revokes=False,
+                apply_revokes=runtime_apply_revokes,
             )
 
         self._stop_framework_best_effort()
@@ -506,6 +508,14 @@ exit
 
         self._start_framework_best_effort()
 
+        if runtime_state:
+            self.logger.info("Post-stage: re-applying runtime state after framework restart ...")
+            self._apply_runtime_state(
+                runtime_state,
+                package_batch_size=self.cfg.runtime_state_batch_size_path,
+                apply_revokes=runtime_apply_revokes,
+            )
+
         # Fixups (kept)
         fix_lines = ["su", "cd /"]
         for uid in plan.user_ids:
@@ -528,7 +538,7 @@ exit
                 f'pm grant --user {uid} {plan.photos_pkg} android.permission.READ_MEDIA_VIDEO >/dev/null 2>&1 || true',
                 f'pm grant --user {uid} {plan.photos_pkg} android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true',
             ]
-        perm += [f'monkey -p {plan.photos_pkg} 1 >/dev/null 2>&1 || true', "exit", "exit"]
+        perm += ["exit", "exit"]
         self.adb.shell_script("\n".join(perm) + "\n", allow_fail=True)
 
         # Ensure SystemUI not stopped (kept)
@@ -702,9 +712,20 @@ exit
         if include_account_db:
             self._start_framework_best_effort()
 
+        if runtime_state:
+            self.logger.info("Post-stage: re-applying runtime state after framework restart ...")
+            self._apply_runtime_state(
+                runtime_state,
+                package_batch_size=self.cfg.runtime_state_batch_size_app,
+                apply_revokes=True,
+            )
+
         self.adb.shell_root(f"rm -f {shlex.quote(device_tar)}", check=False)
 
     def exec_restore_full(self, device_tar: str) -> None:
+        # WARNING: This method bypasses _keystore_locksettings_fixups() entirely —
+        # it untars /data directly. Do NOT re-enable without adding the SDK >= 34
+        # guard to exclude keystore/locksettings from extraction.
         script = f"""
 su
 cd /

@@ -22,6 +22,7 @@ from .tar_index import TarIndexer
 APP_META_FILE = "app_snapshot.json"
 APPS_META_FILE = "apps_snapshot.json"
 FULL_STATE_FILE = "snapshot_state.json"
+PERMISSION_STATE_FILE = "permissions_state.json"
 DEFAULT_AUTH_PKGS = ("com.google.android.gsf.login",)
 PKG_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 APP_OP_MODES = {"allow", "ignore", "deny", "default", "foreground", "errored"}
@@ -377,9 +378,13 @@ def _parse_requested_permissions_from_dumpsys(text: str) -> set[str]:
 def _parse_runtime_permissions_from_dumpsys(text: str, uid: int, include_denied: bool) -> dict[str, bool]:
     lines = text.splitlines()
     perm_line_re = re.compile(r"^\s*([A-Za-z0-9_.]+):\s*granted=(true|false)\b")
-    user_line_re = re.compile(r"^\s*User\s+(\d+):\s*$")
+    # Handles both:
+    #   "User 0:"
+    #   "User 0: ceDataInode=..."
+    user_line_re = re.compile(r"^\s*User\s+(\d+):(?:\s.*)?$")
 
     perms: dict[str, bool] = {}
+    saw_any_user_blocks = False
 
     def _ingest_perm_line(line: str) -> bool:
         m = perm_line_re.match(line)
@@ -396,6 +401,7 @@ def _parse_runtime_permissions_from_dumpsys(text: str, uid: int, include_denied:
     for line in lines:
         user_match = user_line_re.match(line)
         if user_match:
+            saw_any_user_blocks = True
             in_target_user = (int(user_match.group(1)) == uid)
             in_runtime = False
             continue
@@ -417,6 +423,11 @@ def _parse_runtime_permissions_from_dumpsys(text: str, uid: int, include_denied:
             in_runtime = False
 
     if perms:
+        return perms
+
+    # If dumpsys has per-user blocks but target user produced no entries,
+    # don't parse a global fallback section from another user.
+    if saw_any_user_blocks:
         return perms
 
     # Fallback pass: some builds print a single runtime section (without User N blocks).
@@ -452,8 +463,6 @@ def _collect_appops(adb: AdbClient, uid: int, package: str) -> dict[str, str]:
         op = m.group(1)
         mode = m.group(2).lower()
         if mode not in APP_OP_MODES:
-            continue
-        if mode == "default":
             continue
         appops[op] = mode
     return appops
@@ -527,8 +536,6 @@ exit
         op = m2.group(1)
         mode = m2.group(2).lower()
         if mode not in APP_OP_MODES:
-            continue
-        if mode == "default":
             continue
 
         collected.setdefault(cur_uid, {}).setdefault(cur_pkg, {})[op] = mode
@@ -888,7 +895,15 @@ def cmd_backup_thirdparty(args) -> int:
             candidate_paths.extend(_account_db_paths_for_user(uid))
 
     if include_account_db:
-        candidate_paths.extend(_keystore_locksettings_paths())
+        sdk = state.get_sdk_version()
+        if sdk is not None and sdk >= 34:
+            logger.info(
+                "Android 14+ (SDK %d): skipping keystore/locksettings from backup "
+                "(hardware-bound keys are not portable).",
+                sdk,
+            )
+        else:
+            candidate_paths.extend(_keystore_locksettings_paths())
 
     # Keep permission state files in snapshot so restore can replay permissions/appops
     # without restoring global files outside intended package scope.
@@ -956,12 +971,41 @@ def cmd_backup_thirdparty(args) -> int:
         perms_for_user = xml_runtime_by_user.get(uid, {})
         appops_for_user = appops_by_user.get(uid, {})
         for pkg in state_pkgs_by_user.get(uid, []):
+            runtime_permissions = perms_for_user.get(pkg)
+            if runtime_permissions is None:
+                runtime_permissions = _collect_runtime_permissions(adb, uid, pkg, include_denied=True)
+                logger.info(
+                    "Runtime permission fallback (dumpsys): package=%s user=%d entries=%d",
+                    pkg,
+                    uid,
+                    len(runtime_permissions),
+                )
             runtime_state.setdefault(pkg, {})[str(uid)] = {
-                "runtime_permissions": perms_for_user.get(pkg, {}),
+                "runtime_permissions": runtime_permissions if isinstance(runtime_permissions, dict) else {},
                 "appops": appops_for_user.get(pkg, {}),
             }
 
     logger.info("Collected runtime state for %d package(s).", len(runtime_state))
+
+    permission_state_meta = {
+        "type": "permission-state-v1",
+        "scope": "thirdparty",
+        "user_ids": user_ids,
+        "runtime_state": runtime_state,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    (paths.snap_dir / PERMISSION_STATE_FILE).write_text(
+        json.dumps(permission_state_meta, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    if include_account_db:
+        if sdk is not None and sdk >= 34:
+            account_bundle_val = "accounts-only"
+        else:
+            account_bundle_val = "accounts+keystore+locksettings"
+    else:
+        account_bundle_val = "none"
 
     meta = {
         "type": "apps-snapshot-v1",
@@ -970,6 +1014,7 @@ def cmd_backup_thirdparty(args) -> int:
         "thirdparty_by_user": {str(uid): thirdparty_by_user.get(uid, []) for uid in user_ids},
         "auth_packages": auth_pkgs,
         "include_account_db": include_account_db,
+        "account_bundle": account_bundle_val,
         "runtime_state": runtime_state,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -1022,7 +1067,15 @@ def cmd_backup_app(args) -> int:
         if include_account_db:
             candidate_paths.extend(_account_db_paths_for_user(uid))
     if include_account_db:
-        candidate_paths.extend(_keystore_locksettings_paths())
+        sdk = state.get_sdk_version()
+        if sdk is not None and sdk >= 34:
+            logger.info(
+                "Android 14+ (SDK %d): skipping keystore/locksettings from backup "
+                "(hardware-bound keys are not portable).",
+                sdk,
+            )
+        else:
+            candidate_paths.extend(_keystore_locksettings_paths())
     candidate_paths = _unique_keep_order(candidate_paths)
 
     device_tar = "/data/local/tmp/app-backup.tar"
@@ -1075,7 +1128,9 @@ def cmd_backup_app(args) -> int:
         "auth_packages": auth_pkgs,
         "state_packages": state_pkgs,
         "include_account_db": include_account_db,
-        "account_bundle": "accounts+keystore+locksettings" if include_account_db else "none",
+        "account_bundle": (
+            "accounts-only" if (sdk is not None and sdk >= 34) else "accounts+keystore+locksettings"
+        ) if include_account_db else "none",
         "runtime_state": runtime_state,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
@@ -1212,7 +1267,8 @@ def cmd_restore_path(args) -> int:
                 "Scoped restore: no per-app runtime replay metadata; permissions may be partial."
             )
 
-    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120))
+    sdk = state.get_sdk_version()
+    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120, sdk_version=sdk))
     if runtime_state_for_restore:
         logger.info(
             "Applying per-app permission runtime state for %d package(s).",
@@ -1291,19 +1347,37 @@ def cmd_restore_app(args) -> int:
     run_checked(["zstd", "-d", "-f", str(paths.archive_zst), "-o", str(paths.temp_tar)], logger)
     tar_index = TarIndexer(logger).build_from_tar(paths.temp_tar)
 
-    # Safety for legacy app snapshots (created before keystore/locksettings were included).
-    # Restoring AccountManager DB without matching keystore/locksettings can destabilize auth flows.
+    # Safety for legacy/partial app snapshots: if the snapshot claims to include
+    # keystore/locksettings but the tar lacks them, auto-disable AccountManager restore.
+    # SDK 34+ snapshots intentionally omit keystore/locksettings (account_bundle="accounts-only")
+    # — their absence is expected and should NOT trigger auto-disable.
     if include_account_db and args.with_account_db is None:
-        has_keystore = _tar_member_exists(paths.temp_tar, "data/misc/keystore/persistent.sqlite")
-        has_locksettings = _tar_member_exists(paths.temp_tar, "data/system/locksettings.db")
-        if not (has_keystore and has_locksettings):
-            logger.warning(
-                "Legacy snapshot lacks keystore/locksettings bundle; auto-disabling AccountManager DB restore. "
-                "Use --with-account-db to force."
-            )
-            include_account_db = False
+        account_bundle = meta.get("account_bundle")
+        if account_bundle == "accounts-only":
+            pass  # SDK 34+ policy: absence is intentional, keep AccountManager restore enabled
+        elif account_bundle == "accounts+keystore+locksettings":
+            has_keystore = _tar_member_exists(paths.temp_tar, "data/misc/keystore/persistent.sqlite")
+            has_locksettings = _tar_member_exists(paths.temp_tar, "data/system/locksettings.db")
+            if not (has_keystore and has_locksettings):
+                logger.warning(
+                    "Snapshot claims keystore/locksettings bundle but tar lacks them; "
+                    "auto-disabling AccountManager DB restore. Use --with-account-db to force."
+                )
+                include_account_db = False
+        else:
+            # No account_bundle field (very old snapshot): fall back to tar-presence check
+            has_keystore = _tar_member_exists(paths.temp_tar, "data/misc/keystore/persistent.sqlite")
+            has_locksettings = _tar_member_exists(paths.temp_tar, "data/system/locksettings.db")
+            if not (has_keystore and has_locksettings):
+                logger.warning(
+                    "Legacy snapshot lacks keystore/locksettings bundle; auto-disabling AccountManager DB restore. "
+                    "Use --with-account-db to force."
+                )
+                include_account_db = False
 
-    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120))
+    sdk_state = AndroidStateReader(adb, logger)
+    sdk = sdk_state.get_sdk_version()
+    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120, sdk_version=sdk))
     execu.exec_restore_app(
         package=package,
         user_ids=user_ids,
@@ -1382,11 +1456,23 @@ def cmd_restore_thirdparty(args) -> int:
 
     allowed_pkgs = set(auth_pkgs) | {p for pkgs in thirdparty_by_user.values() for p in pkgs}
 
-    runtime_state = meta.get("runtime_state")
-    if not isinstance(runtime_state, dict):
-        runtime_state = {}
-        logger.warning("Snapshot metadata has no runtime_state; runtime permission/appops replay will be skipped.")
+    runtime_state: dict = {}
+    runtime_state_source = APPS_META_FILE
+    permission_state_meta = _read_json_dict(paths.snap_dir / PERMISSION_STATE_FILE)
+    if isinstance(permission_state_meta.get("runtime_state"), dict):
+        runtime_state = permission_state_meta.get("runtime_state", {})
+        runtime_state_source = PERMISSION_STATE_FILE
+    elif isinstance(meta.get("runtime_state"), dict):
+        runtime_state = meta.get("runtime_state", {})
     else:
+        logger.warning(
+            "Snapshot has no runtime_state in %s or %s; runtime permission/appops replay will be skipped.",
+            PERMISSION_STATE_FILE,
+            APPS_META_FILE,
+        )
+
+    if runtime_state:
+        logger.info("Loaded runtime state from %s.", runtime_state_source)
         filtered: dict[str, dict[str, dict]] = {}
         for pkg, user_map in runtime_state.items():
             if not isinstance(pkg, str) or pkg not in allowed_pkgs:
@@ -1438,8 +1524,16 @@ def cmd_restore_thirdparty(args) -> int:
         systemui_pkg=policy.systemui_pkg,
     )
 
-    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120))
-    execu.exec_restore_path(plan, tar_index, local_tar=paths.temp_tar, runtime_state=runtime_state)
+    sdk_state = AndroidStateReader(adb, logger)
+    sdk = sdk_state.get_sdk_version()
+    execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120, sdk_version=sdk))
+    execu.exec_restore_path(
+        plan,
+        tar_index,
+        local_tar=paths.temp_tar,
+        runtime_state=runtime_state,
+        runtime_apply_revokes=True,
+    )
 
     logger.info("Cleaning up host temp tar...")
     try:

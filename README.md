@@ -81,7 +81,7 @@ Included by default:
 - third-party app CE/DE data per selected user
 - app external state (`Android/data`, `Android/media`, `Android/obb`)
 - default auth package data (`com.google.android.gsf.login`), if installed
-- account bundle (AccountManager DB + keystore/locksettings)
+- account bundle (AccountManager DBs; on Android 13 and below also includes keystore/locksettings — excluded on Android 14+ as hardware-bound keys are not portable)
 - permission/appops state needed for restore replay
 
 Usage:
@@ -115,7 +115,7 @@ Included by default:
 
 - target package data (all detected installed users unless constrained)
 - optional extra auth package data
-- account bundle (unless disabled)
+- account bundle (AccountManager DBs; on Android 13 and below also includes keystore/locksettings — excluded on Android 14+ as hardware-bound keys are not portable; unless disabled)
 - per-package runtime permissions/appops metadata
 
 Usage:
