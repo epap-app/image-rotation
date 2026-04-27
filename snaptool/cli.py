@@ -1586,6 +1586,116 @@ def cmd_restore_thirdparty(args) -> int:
 #     return 0
 
 
+PAIRIP_ALTER_INSTALLER_ZIP = "AlterInstaller-2.3-release.zip"
+PAIRIP_DEVICE_JSON = "/data/local/tmp/AlterInstaller.json"
+PAIRIP_DEVICE_ZIP = "/data/local/tmp/AlterInstaller.zip"
+PAIRIP_JSON_PAYLOAD = {
+    "de.dm.meindm.android": {
+        "installer": "com.android.vending",
+        "updateOwner": "com.android.vending",
+    },
+    "com.kaufland.Kaufland": {
+        "installer": "com.android.vending",
+        "updateOwner": "com.android.vending",
+    },
+}
+
+
+def _find_alter_installer_zip() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().parents[1] / "assets" / PAIRIP_ALTER_INSTALLER_ZIP,
+        Path.cwd() / "assets" / PAIRIP_ALTER_INSTALLER_ZIP,
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def cmd_pairip_fix(args) -> int:
+    cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
+    logger = setup_logging(cfg.verbose, log_file=None)
+    adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+
+    zip_path = _find_alter_installer_zip()
+    if zip_path is None:
+        logger.error(
+            "Could not find %s in ./assets/. Place the Magisk module zip there and retry.",
+            PAIRIP_ALTER_INSTALLER_ZIP,
+        )
+        return 1
+    logger.info("Using Magisk module: %s", zip_path)
+
+    devs = adb.adb(["devices"], check=False)
+    dev_lines = [
+        ln for ln in (devs.stdout or "").splitlines()[1:]
+        if ln.strip() and "device" in ln.split()
+    ]
+    if not dev_lines:
+        logger.error("No ADB device detected. Run `adb devices` and ensure the phone is authorized.")
+        return 1
+
+    root_check = adb.shell_root("id", check=False)
+    if root_check.rc != 0 or "uid=0" not in (root_check.stdout or ""):
+        logger.error(
+            "Root shell unavailable (su -c id failed). This command requires a rooted device with Magisk."
+        )
+        return 1
+
+    magisk_check = adb.shell_root("command -v magisk >/dev/null 2>&1 && echo OK || echo MISSING", check=False)
+    if "OK" not in (magisk_check.stdout or ""):
+        logger.error("`magisk` binary not found on device. Install Magisk before running pairip-fix.")
+        return 1
+
+    logger.info("Pushing module to %s ...", PAIRIP_DEVICE_ZIP)
+    adb.shell_root(f"rm -f {shlex.quote(PAIRIP_DEVICE_ZIP)}", check=False)
+    adb.adb(["push", str(zip_path), PAIRIP_DEVICE_ZIP], check=True)
+
+    verify = adb.shell_root(f"ls -l {shlex.quote(PAIRIP_DEVICE_ZIP)} 2>/dev/null || true", check=False)
+    if PAIRIP_DEVICE_ZIP.split("/")[-1] not in (verify.stdout or ""):
+        logger.error("Failed to push module zip to device.")
+        return 1
+
+    logger.info("Installing Magisk module (magisk --install-module) ...")
+    install = adb.shell_root(f"magisk --install-module {shlex.quote(PAIRIP_DEVICE_ZIP)}", check=False)
+    if install.rc != 0:
+        logger.error("Magisk module installation failed (rc=%s).", install.rc)
+        if (install.stdout or "").strip():
+            logger.error("stdout:\n%s", install.stdout.strip())
+        if (install.stderr or "").strip():
+            logger.error("stderr:\n%s", install.stderr.strip())
+        adb.shell_root(f"rm -f {shlex.quote(PAIRIP_DEVICE_ZIP)}", check=False)
+        return 1
+
+    adb.shell_root(f"rm -f {shlex.quote(PAIRIP_DEVICE_ZIP)}", check=False)
+
+    logger.info("Writing %s ...", PAIRIP_DEVICE_JSON)
+    json_payload = json.dumps(PAIRIP_JSON_PAYLOAD, indent=4)
+    write_script = f"""
+su
+rm -f {shlex.quote(PAIRIP_DEVICE_JSON)}
+cat > {shlex.quote(PAIRIP_DEVICE_JSON)} <<'PAIRIP_EOF'
+{json_payload}
+PAIRIP_EOF
+chmod 644 {shlex.quote(PAIRIP_DEVICE_JSON)}
+exit
+exit
+"""
+    adb.shell_script(write_script, allow_fail=False)
+
+    json_verify = adb.shell_root(f"ls -l {shlex.quote(PAIRIP_DEVICE_JSON)} 2>/dev/null || true", check=False)
+    if PAIRIP_DEVICE_JSON.split("/")[-1] not in (json_verify.stdout or ""):
+        logger.error("Failed to create %s on device.", PAIRIP_DEVICE_JSON)
+        return 1
+
+    logger.info("Rebooting device ...")
+    adb.adb(["reboot"], check=False)
+
+    logger.info("Pairip has been fixed successfully")
+    print("Pairip has been fixed successfully")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Android /data backup & restore helper")
     parser.add_argument("--serial", help="adb device serial (optional)")
@@ -1694,6 +1804,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auth package data to restore (repeatable). If omitted, uses snapshot metadata/defaults",
     )
     p_restore_tp.set_defaults(func=cmd_restore_thirdparty)
+
+    p_pairip = sub.add_parser(
+        "pairip-fix",
+        help="Install AlterInstaller Magisk module, write AlterInstaller.json, and reboot",
+    )
+    p_pairip.set_defaults(func=cmd_pairip_fix)
 
     # p_restore_full = sub.add_parser("restore-full", help="Restore full /data from snapshot (DANGEROUS)")
     # p_restore_full.add_argument("snapshot", help="Snapshot name")

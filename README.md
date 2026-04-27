@@ -10,6 +10,7 @@ Supported commands:
 - `restore-path` - restore from full snapshot with package scope filtering
 - `restore-app` - restore one app snapshot
 - `restore-thirdparty` - restore a `backup-thirdparty` snapshot
+- `pairip-fix` - install the AlterInstaller Magisk module, write `/data/local/tmp/AlterInstaller.json`, and reboot
 
 ## Requirements
 
@@ -224,6 +225,52 @@ python3 recovery_tool.py restore-thirdparty zero3party --user 0 --user 10
 python3 recovery_tool.py restore-thirdparty zero3party --auth-pkg com.example.auth
 ```
 
+### 7) `pairip-fix`
+
+Installs the bundled `assets/AlterInstaller-2.3-release.zip` Magisk module on the device, writes `/data/local/tmp/AlterInstaller.json` (replacing any existing file), and reboots the device.
+
+The JSON written to the device is:
+
+```json
+{
+    "de.dm.meindm.android": {
+        "installer": "com.android.vending",
+        "updateOwner": "com.android.vending"
+    },
+    "com.kaufland.Kaufland": {
+        "installer": "com.android.vending",
+        "updateOwner": "com.android.vending"
+    }
+}
+```
+
+Requirements (checked at runtime):
+
+- `assets/AlterInstaller-2.3-release.zip` exists on the host
+- An ADB device is connected and authorized
+- The device is rooted (`su -c id` returns uid=0)
+- The `magisk` binary is available on the device
+
+Usage:
+
+```bash
+python3 recovery_tool.py pairip-fix
+```
+
+Examples:
+
+```bash
+python3 recovery_tool.py pairip-fix
+python3 recovery_tool.py --verbose pairip-fix
+python3 recovery_tool.py --serial <device_serial> pairip-fix
+```
+
+On success, the device reboots and the tool prints:
+
+```
+Pairip has been fixed successfully
+```
+
 ## Snapshot Layout
 
 Snapshots are created under:
@@ -274,6 +321,7 @@ python3 recovery_tool.py backup-app -h
 python3 recovery_tool.py restore-path -h
 python3 recovery_tool.py restore-app -h
 python3 recovery_tool.py restore-thirdparty -h
+python3 recovery_tool.py pairip-fix -h
 ```
 
 ## Troubleshooting Quick Checks
