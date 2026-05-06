@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -13,6 +15,7 @@ from .adb import AdbClient
 from .android_state import AndroidStateReader
 from .config import SnapshotPaths, ToolConfig
 from .executor import ExecConfig, RestoreExecutor
+from . import keystore_merge
 from .logging_setup import setup_logging
 from .planner import RestorePlan, RestorePlanner
 from .policy import RestorePolicy
@@ -23,6 +26,8 @@ APP_META_FILE = "app_snapshot.json"
 APPS_META_FILE = "apps_snapshot.json"
 FULL_STATE_FILE = "snapshot_state.json"
 PERMISSION_STATE_FILE = "permissions_state.json"
+KEYSTORE_ROWS_FILE = "keystore_rows.json"
+ANDROID_PER_USER_RANGE = 100000
 DEFAULT_AUTH_PKGS = ("com.google.android.gsf.login",)
 PKG_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 APP_OP_MODES = {"allow", "ignore", "deny", "default", "foreground", "errored"}
@@ -772,6 +777,233 @@ def _snapshot_has_permission_state(local_tar: Path, user_ids: list[int]) -> bool
     return False
 
 
+# ----------------------------------------------------------------------------
+# Per-UID keystore2 capture / restore (Option B)
+#
+# Replaces the old whole-DB /data/misc/keystore tar inclusion with a JSON-side
+# per-UID dump that we merge back row-by-row at restore time. Bound to the
+# source device by a fingerprint hash so the wrapped TEE blobs can never be
+# applied to a foreign device's keystore.
+# ----------------------------------------------------------------------------
+
+def _get_device_fingerprint(adb: AdbClient) -> str:
+    res = adb.adb(
+        ["shell", "getprop ro.serialno; getprop ro.product.model"],
+        check=False,
+    )
+    return hashlib.sha256((res.stdout or "").strip().encode("utf-8")).hexdigest()
+
+
+def _get_appid_for_package(adb: AdbClient, package: str) -> int | None:
+    # Android 14+ dumpsys uses `appId=`, older builds print `userId=` for the
+    # same value. Accept both, plus the `uid=<n> gids=` line as a final fallback.
+    res = adb.shell_root(
+        f"dumpsys package {shlex.quote(package)} 2>/dev/null || true",
+        check=False,
+    )
+    text = res.stdout or ""
+    for pat in (r"\bappId=(\d+)", r"\buserId=(\d+)", r"^\s*uid=(\d+)\s+gids="):
+        m = re.search(pat, text, re.MULTILINE)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _per_user_uid(user_id: int, appid: int) -> int:
+    return user_id * ANDROID_PER_USER_RANGE + appid
+
+
+def _capture_keystore_rows_for_packages(
+    adb: AdbClient,
+    snap_dir: Path,
+    package_users: dict,
+    logger,
+) -> bool:
+    """Capture keystore2 rows for `package_users` ({pkg: [user_ids]}) into
+    `snap_dir/keystore_rows.json`. Returns True on success.
+    """
+    package_uids: dict[str, dict[str, int]] = {}
+    all_uids: set[int] = set()
+
+    for package, user_ids in package_users.items():
+        appid = _get_appid_for_package(adb, package)
+        if appid is None:
+            logger.info("Keystore capture: package %s not installed; skipping.", package)
+            continue
+        per_user: dict[str, int] = {}
+        for uid in user_ids:
+            per_user_uid_val = _per_user_uid(int(uid), appid)
+            per_user[str(uid)] = per_user_uid_val
+            all_uids.add(per_user_uid_val)
+        package_uids[package] = per_user
+
+    if not package_uids or not all_uids:
+        logger.info("Keystore capture: no installed packages to capture; skipping.")
+        return False
+
+    remote_db = "/data/local/tmp/keystore-snap.sqlite"
+    capture_script = (
+        "su\n"
+        "set +e\n"
+        "if command -v stop >/dev/null 2>&1; then\n"
+        "  stop keystore2 >/dev/null 2>&1 || true\n"
+        "  stop credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "if command -v setprop >/dev/null 2>&1; then\n"
+        "  setprop ctl.stop keystore2 >/dev/null 2>&1 || true\n"
+        "  setprop ctl.stop credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "sleep 1\n"
+        f"cp -f /data/misc/keystore/persistent.sqlite {remote_db}\n"
+        f"chmod 0644 {remote_db}\n"
+        "if command -v start >/dev/null 2>&1; then\n"
+        "  start keystore2 >/dev/null 2>&1 || true\n"
+        "  start credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "if command -v setprop >/dev/null 2>&1; then\n"
+        "  setprop ctl.start keystore2 >/dev/null 2>&1 || true\n"
+        "  setprop ctl.start credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "exit\nexit\n"
+    )
+    adb.shell_script(capture_script, allow_fail=True)
+
+    local_tmp = snap_dir / "_keystore_pull.sqlite"
+    try:
+        adb.adb(["pull", remote_db, str(local_tmp)], check=True)
+        snapshot = keystore_merge.dump_rows_for_uids(local_tmp, sorted(all_uids), logger)
+        snapshot["package_uids"] = package_uids
+        snapshot["device_fingerprint"] = _get_device_fingerprint(adb)
+        snapshot["captured_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        keystore_merge.write_snapshot(snapshot, snap_dir / KEYSTORE_ROWS_FILE)
+        logger.info(
+            "Keystore capture: wrote %s for %d package(s), %d UID(s).",
+            KEYSTORE_ROWS_FILE, len(package_uids), len(all_uids),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Keystore capture failed (continuing): %s", exc)
+        return False
+    finally:
+        try:
+            local_tmp.unlink()
+        except FileNotFoundError:
+            pass
+        adb.shell_root(f"rm -f {shlex.quote(remote_db)}", check=False)
+
+
+def _prepare_keystore_merged_db(
+    adb: AdbClient,
+    snap_dir: Path,
+    logger,
+) -> Path | None:
+    """Build a host-side merged keystore SQLite combining the snapshot's per-UID
+    rows with the live device's persistent.sqlite. Returns the local path of
+    the merged DB to push back, or None to fall back to legacy behavior.
+    """
+    rows_path = snap_dir / KEYSTORE_ROWS_FILE
+    snapshot = keystore_merge.read_snapshot(rows_path)
+    if not snapshot:
+        return None
+
+    snap_fp = snapshot.get("device_fingerprint")
+    live_fp = _get_device_fingerprint(adb)
+    if snap_fp and snap_fp != live_fp:
+        logger.warning(
+            "Keystore restore aborted: device fingerprint mismatch "
+            "(snapshot=%s..., live=%s...). Snapshot was taken on a different device — "
+            "wrapped TEE blobs will not unwrap here.",
+            (snap_fp or "?")[:12], (live_fp or "?")[:12],
+        )
+        return None
+
+    package_uids = snapshot.get("package_uids") or {}
+    if not package_uids:
+        logger.warning("keystore_rows.json has no package_uids map; skipping keystore restore.")
+        return None
+
+    uid_remap: dict[int, int] = {}
+    missing_pkgs: list[str] = []
+    for pkg, user_uid_map in package_uids.items():
+        live_appid = _get_appid_for_package(adb, pkg)
+        if live_appid is None:
+            missing_pkgs.append(pkg)
+            continue
+        for user_id_str, snap_uid in user_uid_map.items():
+            try:
+                user_id = int(user_id_str)
+                snap_uid_int = int(snap_uid)
+            except (TypeError, ValueError):
+                continue
+            uid_remap[snap_uid_int] = _per_user_uid(user_id, live_appid)
+
+    if missing_pkgs:
+        logger.warning(
+            "Keystore restore: %d package(s) not installed live, their keys will be skipped: %s",
+            len(missing_pkgs),
+            ", ".join(missing_pkgs[:5]) + ("…" if len(missing_pkgs) > 5 else ""),
+        )
+
+    if not uid_remap:
+        logger.warning("Keystore restore: no live UIDs resolved; skipping.")
+        return None
+
+    remote_live = "/data/local/tmp/keystore-live.sqlite"
+    pull_script = (
+        "su\n"
+        "set +e\n"
+        "if command -v stop >/dev/null 2>&1; then\n"
+        "  stop keystore2 >/dev/null 2>&1 || true\n"
+        "  stop credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "if command -v setprop >/dev/null 2>&1; then\n"
+        "  setprop ctl.stop keystore2 >/dev/null 2>&1 || true\n"
+        "  setprop ctl.stop credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "sleep 1\n"
+        f"cp -f /data/misc/keystore/persistent.sqlite {remote_live}\n"
+        f"chmod 0644 {remote_live}\n"
+        "if command -v start >/dev/null 2>&1; then\n"
+        "  start keystore2 >/dev/null 2>&1 || true\n"
+        "  start credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "if command -v setprop >/dev/null 2>&1; then\n"
+        "  setprop ctl.start keystore2 >/dev/null 2>&1 || true\n"
+        "  setprop ctl.start credstore >/dev/null 2>&1 || true\n"
+        "fi\n"
+        "exit\nexit\n"
+    )
+    adb.shell_script(pull_script, allow_fail=True)
+
+    local_live = snap_dir / "_keystore_live.sqlite"
+    local_merged = snap_dir / "_keystore_merged.sqlite"
+    try:
+        adb.adb(["pull", remote_live, str(local_live)], check=True)
+        shutil.copyfile(local_live, local_merged)
+        stats = keystore_merge.merge_rows_into_db(local_merged, snapshot, uid_remap, logger)
+        if stats.get("inserted", 0) == 0:
+            logger.info("Keystore merge produced no inserts; skipping push-back.")
+            try:
+                local_merged.unlink()
+            except FileNotFoundError:
+                pass
+            return None
+        return local_merged
+    except Exception as exc:
+        logger.warning("Keystore merge failed (skipping keystore restore): %s", exc)
+        try:
+            local_merged.unlink()
+        except FileNotFoundError:
+            pass
+        return None
+    finally:
+        try:
+            local_live.unlink()
+        except FileNotFoundError:
+            pass
+        adb.shell_root(f"rm -f {shlex.quote(remote_live)}", check=False)
+
+
 def cmd_backup(args) -> int:
     cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
     cfg.snap_root.mkdir(parents=True, exist_ok=True)
@@ -947,6 +1179,18 @@ def cmd_backup_thirdparty(args) -> int:
     logger.info("Compressing with zstd...")
     run_checked(["zstd", "-T0", "-3", "-f", str(local_tar), "-o", str(paths.archive_zst)], logger)
 
+    logger.info("Capturing per-UID keystore rows...")
+    keystore_package_users: dict[str, list[int]] = {}
+    for uid in user_ids:
+        for pkg in state_pkgs_by_user.get(uid, []):
+            keystore_package_users.setdefault(pkg, []).append(uid)
+    _capture_keystore_rows_for_packages(
+        adb,
+        paths.snap_dir,
+        package_users=keystore_package_users,
+        logger=logger,
+    )
+
     logger.info("Collecting runtime state (permissions/appops) for %d package(s)...", len(state_pkgs))
     xml_runtime_by_user: dict[int, dict[str, dict[str, bool]]] = {}
     for uid in user_ids:
@@ -1111,6 +1355,14 @@ def cmd_backup_app(args) -> int:
 
     logger.info("Compressing with zstd...")
     run_checked(["zstd", "-T0", "-3", "-f", str(local_tar), "-o", str(paths.archive_zst)], logger)
+
+    logger.info("Capturing per-UID keystore rows...")
+    _capture_keystore_rows_for_packages(
+        adb,
+        paths.snap_dir,
+        package_users={pkg: user_ids for pkg in state_pkgs},
+        logger=logger,
+    )
 
     logger.info("Collecting package runtime state (permissions/appops)...")
     runtime_state = _collect_package_runtime_state(
@@ -1378,15 +1630,28 @@ def cmd_restore_app(args) -> int:
     sdk_state = AndroidStateReader(adb, logger)
     sdk = sdk_state.get_sdk_version()
     execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120, sdk_version=sdk))
-    execu.exec_restore_app(
-        package=package,
-        user_ids=user_ids,
-        local_tar=paths.temp_tar,
-        auth_pkgs=auth_pkgs,
-        include_account_db=include_account_db,
-        present_roots=tar_index.present_roots,
-        runtime_state=runtime_state,
-    )
+
+    keystore_merged: Path | None = None
+    if include_account_db:
+        keystore_merged = _prepare_keystore_merged_db(adb, paths.snap_dir, logger)
+
+    try:
+        execu.exec_restore_app(
+            package=package,
+            user_ids=user_ids,
+            local_tar=paths.temp_tar,
+            auth_pkgs=auth_pkgs,
+            include_account_db=include_account_db,
+            present_roots=tar_index.present_roots,
+            runtime_state=runtime_state,
+            keystore_merged_local_path=keystore_merged,
+        )
+    finally:
+        if keystore_merged is not None:
+            try:
+                keystore_merged.unlink()
+            except FileNotFoundError:
+                pass
 
     logger.info("Cleaning up host temp tar...")
     try:
@@ -1527,13 +1792,24 @@ def cmd_restore_thirdparty(args) -> int:
     sdk_state = AndroidStateReader(adb, logger)
     sdk = sdk_state.get_sdk_version()
     execu = RestoreExecutor(adb, logger, ExecConfig(chunk_size=120, sdk_version=sdk))
-    execu.exec_restore_path(
-        plan,
-        tar_index,
-        local_tar=paths.temp_tar,
-        runtime_state=runtime_state,
-        runtime_apply_revokes=True,
-    )
+
+    keystore_merged = _prepare_keystore_merged_db(adb, paths.snap_dir, logger)
+
+    try:
+        execu.exec_restore_path(
+            plan,
+            tar_index,
+            local_tar=paths.temp_tar,
+            runtime_state=runtime_state,
+            runtime_apply_revokes=True,
+            keystore_merged_local_path=keystore_merged,
+        )
+    finally:
+        if keystore_merged is not None:
+            try:
+                keystore_merged.unlink()
+            except FileNotFoundError:
+                pass
 
     logger.info("Cleaning up host temp tar...")
     try:

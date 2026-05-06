@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
 
 from .adb import AdbClient
 from .planner import RestorePlan
@@ -248,6 +249,67 @@ class RestoreExecutor:
         ]
         self.adb.shell_script("\n".join(lines), allow_fail=True)
 
+    def _keystore_per_uid_fixup(self, merged_sqlite_local_path: Path) -> None:
+        """Replace /data/misc/keystore/persistent.sqlite with a host-side merged
+        copy that contains the snapshot's per-UID rows folded into the live DB.
+
+        Caller is responsible for producing the merged file via
+        snaptool.keystore_merge.merge_rows_into_db. We stop keystore2/credstore,
+        cp the merged file into place with correct owner/perms/SELinux context,
+        and restart the services.
+        """
+        self.logger.info("Post-restore: per-UID keystore merge ...")
+
+        remote_merged = "/data/local/tmp/keystore-snaptool-merged.sqlite"
+        backup_remote = "/data/local/tmp/keystore-snaptool-rollback.sqlite"
+
+        self.adb.adb(["push", str(merged_sqlite_local_path), remote_merged], check=True)
+
+        qm = shlex.quote(remote_merged)
+        qb = shlex.quote(backup_remote)
+
+        script = f"""
+su
+set +e
+KS_DB=/data/misc/keystore/persistent.sqlite
+
+if command -v stop >/dev/null 2>&1; then
+  stop keystore2 >/dev/null 2>&1 || true
+  stop credstore >/dev/null 2>&1 || true
+fi
+if command -v setprop >/dev/null 2>&1; then
+  setprop ctl.stop keystore2 >/dev/null 2>&1 || true
+  setprop ctl.stop credstore >/dev/null 2>&1 || true
+fi
+sleep 1
+
+cp -f "$KS_DB" {qb} 2>/dev/null || true
+cp -f {qm} "$KS_DB"
+rm -f "$KS_DB-wal" "$KS_DB-shm" 2>/dev/null || true
+
+chown keystore:keystore "$KS_DB" 2>/dev/null || true
+chmod 0600 "$KS_DB" 2>/dev/null || true
+if command -v restorecon >/dev/null 2>&1; then
+  restorecon -F "$KS_DB" >/dev/null 2>&1 || true
+fi
+sync
+
+if command -v start >/dev/null 2>&1; then
+  start keystore2 >/dev/null 2>&1 || true
+  start credstore >/dev/null 2>&1 || true
+fi
+if command -v setprop >/dev/null 2>&1; then
+  setprop ctl.start keystore2 >/dev/null 2>&1 || true
+  setprop ctl.start credstore >/dev/null 2>&1 || true
+fi
+sleep 1
+
+rm -f {qm} 2>/dev/null || true
+exit
+exit
+"""
+        self.adb.shell_script(script, allow_fail=True)
+
     # ---------------- NEW: keystore2 + locksettings fixups ----------------
     def _keystore_locksettings_fixups(self, device_tar: str) -> None:
         """
@@ -357,6 +419,7 @@ class RestoreExecutor:
         runtime_state: dict | None = None,
         runtime_apply_revokes: bool = False,
         device_tar: str = "/data/local/tmp/restore.tar",
+        keystore_merged_local_path: Path | None = None,
     ) -> None:
         ch = self.cfg.chunk_size
 
@@ -491,8 +554,13 @@ exit
 """
             self.adb.shell_script(script, allow_fail=True)
 
-        # NEW: restore keystore2 + locksettings (if present) BEFORE accounts DB replace
-        self._keystore_locksettings_fixups(device_tar)
+        # Per-UID keystore merge takes precedence over the legacy whole-DB tar
+        # extraction. Newer snapshots ship keystore_rows.json; older ones still
+        # rely on /data/misc/keystore inside the tar (SDK <34 only).
+        if keystore_merged_local_path is not None:
+            self._keystore_per_uid_fixup(keystore_merged_local_path)
+        else:
+            self._keystore_locksettings_fixups(device_tar)
 
         # AccountManager DB replace + perms/contexts
         self._accountmanager_fixups(plan.user_ids, device_tar)
@@ -568,6 +636,7 @@ exit
         present_roots: set[str] | None = None,
         runtime_state: dict | None = None,
         device_tar: str = "/data/local/tmp/restore-app.tar",
+        keystore_merged_local_path: Path | None = None,
     ) -> None:
         if not user_ids:
             self.logger.warning("No users supplied for app restore; nothing to do.")
@@ -692,7 +761,10 @@ exit
             self.adb.shell_script(script, allow_fail=True)
 
         if include_account_db:
-            self._keystore_locksettings_fixups(device_tar)
+            if keystore_merged_local_path is not None:
+                self._keystore_per_uid_fixup(keystore_merged_local_path)
+            else:
+                self._keystore_locksettings_fixups(device_tar)
             self._accountmanager_fixups(user_ids, device_tar)
 
         restorecon_lines = ["su", "sync"]
