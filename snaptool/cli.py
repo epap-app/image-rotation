@@ -19,7 +19,7 @@ from . import keystore_merge
 from .logging_setup import setup_logging
 from .planner import RestorePlan, RestorePlanner
 from .policy import RestorePolicy
-from .runner import run_checked
+from .runner import SnaptoolAbortedError, run_checked
 from .tar_index import TarIndexer
 
 APP_META_FILE = "app_snapshot.json"
@@ -185,7 +185,12 @@ fi
 exit
 exit
 """
-    res = adb.shell_script(script, allow_fail=True)
+    res = adb.shell_script(
+        script,
+        critical=True,
+        phase="backup: create device tar",
+        reason="could not create backup tar on device",
+    )
     return marker not in (res.stdout or "")
 
 
@@ -866,11 +871,47 @@ def _capture_keystore_rows_for_packages(
         "fi\n"
         "exit\nexit\n"
     )
-    adb.shell_script(capture_script, allow_fail=True)
+    try:
+        adb.shell_script(
+            capture_script,
+            critical=True,
+            phase="backup: capture keystore",
+            reason="could not capture keystore DB on device",
+        )
+    finally:
+        # If the capture script aborted after stopping keystore2 but before
+        # restarting (transport drop), make a best-effort restart so the
+        # device isn't left with a dead keystore service.
+        try:
+            adb.shell_script(
+                "su\n"
+                "if command -v start >/dev/null 2>&1; then\n"
+                "  start keystore2 >/dev/null 2>&1 || true\n"
+                "  start credstore >/dev/null 2>&1 || true\n"
+                "fi\n"
+                "if command -v setprop >/dev/null 2>&1; then\n"
+                "  setprop ctl.start keystore2 >/dev/null 2>&1 || true\n"
+                "  setprop ctl.start credstore >/dev/null 2>&1 || true\n"
+                "fi\n"
+                "exit\nexit\n",
+                critical=False,
+                phase="backup: keystore restart safety net",
+            )
+        except SnaptoolAbortedError as exc:
+            logger.error(
+                "KEYSTORE RESTART FAILED after backup keystore capture; "
+                "device keystore may be inaccessible until reboot. (%s)",
+                exc,
+            )
 
     local_tmp = snap_dir / "_keystore_pull.sqlite"
     try:
-        adb.adb(["pull", remote_db, str(local_tmp)], check=True)
+        adb.adb(
+            ["pull", remote_db, str(local_tmp)],
+            critical=True,
+            phase="backup: pull keystore DB",
+            reason="could not pull keystore DB to host",
+        )
         snapshot = keystore_merge.dump_rows_for_uids(local_tmp, sorted(all_uids), logger)
         snapshot["package_uids"] = package_uids
         snapshot["device_fingerprint"] = _get_device_fingerprint(adb)
@@ -881,8 +922,10 @@ def _capture_keystore_rows_for_packages(
             KEYSTORE_ROWS_FILE, len(package_uids), len(all_uids),
         )
         return True
+    except SnaptoolAbortedError:
+        raise
     except Exception as exc:
-        logger.warning("Keystore capture failed (continuing): %s", exc)
+        logger.warning("Keystore capture post-processing failed (continuing): %s", exc)
         return False
     finally:
         try:
@@ -973,12 +1016,22 @@ def _prepare_keystore_merged_db(
         "fi\n"
         "exit\nexit\n"
     )
-    adb.shell_script(pull_script, allow_fail=True)
+    adb.shell_script(
+        pull_script,
+        critical=True,
+        phase="restore: export live keystore",
+        reason="could not export live keystore DB on device",
+    )
 
     local_live = snap_dir / "_keystore_live.sqlite"
     local_merged = snap_dir / "_keystore_merged.sqlite"
     try:
-        adb.adb(["pull", remote_live, str(local_live)], check=True)
+        adb.adb(
+            ["pull", remote_live, str(local_live)],
+            critical=True,
+            phase="restore: pull live keystore",
+            reason="could not pull live keystore DB to host",
+        )
         shutil.copyfile(local_live, local_merged)
         stats = keystore_merge.merge_rows_into_db(local_merged, snapshot, uid_remap, logger)
         if stats.get("inserted", 0) == 0:
@@ -989,6 +1042,14 @@ def _prepare_keystore_merged_db(
                 pass
             return None
         return local_merged
+    except SnaptoolAbortedError:
+        # Transport / critical adb failure — don't swallow; let the CLI top-level
+        # turn it into a "restore-failed: ..." message and abort.
+        try:
+            local_merged.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     except Exception as exc:
         logger.warning("Keystore merge failed (skipping keystore restore): %s", exc)
         try:
@@ -1037,24 +1098,30 @@ tar \\
 exit
 exit
 """
-    adb.shell_script(script, allow_fail=True)
+    adb.shell_script(
+        script,
+        critical=True,
+        phase="backup: create /data tar",
+        reason="could not create /data tar on device",
+    )
 
     logger.info("Verifying device tar exists and is non-empty...")
-    res = subprocess.run(
-        ["adb"] + (["-s", cfg.adb_serial] if cfg.adb_serial else []) +
-        ["shell", "su", "-c", f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        errors="ignore",
-        check=False,
+    res = adb.shell_root(
+        f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true",
+        critical=False,
+        phase="backup: verify device tar",
     )
     if not res.stdout or "data-backup.tar" not in res.stdout:
         logger.error("Device tar not found; backup failed.")
         return 1
 
     logger.info("Pulling device tar to host...")
-    adb.adb(["pull", device_tar, str(local_tar)], check=True)
+    adb.adb(
+        ["pull", device_tar, str(local_tar)],
+        critical=True,
+        phase="backup: pull tar",
+        reason="could not pull backup tar to host",
+    )
 
     logger.info("Compressing with zstd...")
     run_checked(["zstd", "-T0", "-3", "-f", str(local_tar), "-o", str(paths.archive_zst)], logger)
@@ -1160,21 +1227,22 @@ def cmd_backup_thirdparty(args) -> int:
         return 1
 
     logger.info("Verifying device tar exists and is non-empty...")
-    res = subprocess.run(
-        ["adb"] + (["-s", cfg.adb_serial] if cfg.adb_serial else []) +
-        ["shell", "su", "-c", f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        errors="ignore",
-        check=False,
+    res = adb.shell_root(
+        f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true",
+        critical=False,
+        phase="backup-thirdparty: verify device tar",
     )
     if not res.stdout or "apps-backup.tar" not in res.stdout:
         logger.error("Device tar not found; backup-thirdparty failed.")
         return 1
 
     logger.info("Pulling device tar to host...")
-    adb.adb(["pull", device_tar, str(local_tar)], check=True)
+    adb.adb(
+        ["pull", device_tar, str(local_tar)],
+        critical=True,
+        phase="backup-thirdparty: pull tar",
+        reason="could not pull backup tar to host",
+    )
 
     logger.info("Compressing with zstd...")
     run_checked(["zstd", "-T0", "-3", "-f", str(local_tar), "-o", str(paths.archive_zst)], logger)
@@ -1337,21 +1405,22 @@ def cmd_backup_app(args) -> int:
         return 1
 
     logger.info("Verifying device tar exists and is non-empty...")
-    res = subprocess.run(
-        ["adb"] + (["-s", cfg.adb_serial] if cfg.adb_serial else []) +
-        ["shell", "su", "-c", f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        errors="ignore",
-        check=False,
+    res = adb.shell_root(
+        f"ls -l {shlex.quote(device_tar)} 2>/dev/null || true",
+        critical=False,
+        phase="backup-app: verify device tar",
     )
     if not res.stdout or "app-backup.tar" not in res.stdout:
         logger.error("Device tar not found; backup-app failed.")
         return 1
 
     logger.info("Pulling device tar to host...")
-    adb.adb(["pull", device_tar, str(local_tar)], check=True)
+    adb.adb(
+        ["pull", device_tar, str(local_tar)],
+        critical=True,
+        phase="backup-app: pull tar",
+        reason="could not pull backup tar to host",
+    )
 
     logger.info("Compressing with zstd...")
     run_checked(["zstd", "-T0", "-3", "-f", str(local_tar), "-o", str(paths.archive_zst)], logger)
@@ -2098,4 +2167,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    cmd = getattr(args, "cmd", None) or "command"
+    op = "restore" if cmd.startswith("restore") else ("backup" if cmd.startswith("backup") else cmd)
+    try:
+        return int(args.func(args))
+    except SnaptoolAbortedError as exc:
+        print(f"{op}-failed: {exc}")
+        return 2

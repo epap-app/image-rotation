@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import shlex
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .adb import AdbClient
 from .planner import RestorePlan
+from .runner import SnaptoolAbortedError
 from .tar_index import TarIndex
 
 
@@ -83,7 +85,11 @@ class RestoreExecutor:
             "exit",
             "",
         ]
-        self.adb.shell_script("\n".join(lines), allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(lines),
+            critical=False,
+            phase="restore: media refresh",
+        )
 
     def _stop_framework_best_effort(self) -> None:
         self.logger.info("Stopping framework (best-effort) ...")
@@ -95,7 +101,8 @@ class RestoreExecutor:
             "setprop ctl.stop zygote_secondary 2>/dev/null || true; "
             "fi\n"
             "exit\nexit\n",
-            allow_fail=True,
+            critical=False,
+            phase="restore: stop framework",
         )
 
     def _start_framework_best_effort(self) -> None:
@@ -109,8 +116,70 @@ class RestoreExecutor:
             "fi\n"
             "sleep 2\n"
             "exit\nexit\n",
-            allow_fail=True,
+            critical=False,
+            phase="restore: start framework",
         )
+
+    @contextmanager
+    def _framework_stopped(self):
+        """Stop the Android framework, run the body, then ALWAYS restart.
+
+        If the body raises (e.g. a critical adb call aborts mid-restore), the
+        restart still runs in a `finally` so we don't leave the device with
+        zygote dead. A failure of the restart itself is logged loudly but
+        swallowed, so it doesn't mask the original error.
+        """
+        self._stop_framework_best_effort()
+        try:
+            yield
+        finally:
+            try:
+                self._start_framework_best_effort()
+            except SnaptoolAbortedError as exc:
+                self.logger.error(
+                    "FRAMEWORK RESTART FAILED after restore exit; "
+                    "device may not boot until manual reboot. (%s)",
+                    exc,
+                )
+            except Exception as exc:
+                self.logger.error(
+                    "FRAMEWORK RESTART FAILED (unexpected) after restore exit; "
+                    "device may not boot until manual reboot. (%s)",
+                    exc,
+                )
+
+    def _restart_keystore_safety_net(self) -> None:
+        """Best-effort, swallow-all restart of keystore2/credstore. Used inside
+        a finally on the keystore swap scripts: if the swap script aborted
+        mid-stream (transport drop after stop, before start), the in-script
+        restart never ran. We try once more here over a fresh adb call."""
+        try:
+            self.adb.shell_script(
+                "su\n"
+                "if command -v start >/dev/null 2>&1; then\n"
+                "  start keystore2 >/dev/null 2>&1 || true\n"
+                "  start credstore >/dev/null 2>&1 || true\n"
+                "fi\n"
+                "if command -v setprop >/dev/null 2>&1; then\n"
+                "  setprop ctl.start keystore2 >/dev/null 2>&1 || true\n"
+                "  setprop ctl.start credstore >/dev/null 2>&1 || true\n"
+                "fi\n"
+                "exit\nexit\n",
+                critical=False,
+                phase="restore: keystore restart safety net",
+            )
+        except SnaptoolAbortedError as exc:
+            self.logger.error(
+                "KEYSTORE RESTART FAILED after restore exit; accounts/keystore "
+                "may be inaccessible until reboot. (%s)",
+                exc,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "KEYSTORE RESTART FAILED (unexpected) after restore exit; "
+                "accounts/keystore may be inaccessible until reboot. (%s)",
+                exc,
+            )
 
     def _apply_runtime_state(
         self,
@@ -247,7 +316,12 @@ class RestoreExecutor:
             "exit",
             "",
         ]
-        self.adb.shell_script("\n".join(lines), allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(lines),
+            critical=True,
+            phase="restore: permission state file fixups",
+            reason="could not restore permission state file owners/contexts",
+        )
 
     def _keystore_per_uid_fixup(self, merged_sqlite_local_path: Path) -> None:
         """Replace /data/misc/keystore/persistent.sqlite with a host-side merged
@@ -263,7 +337,12 @@ class RestoreExecutor:
         remote_merged = "/data/local/tmp/keystore-snaptool-merged.sqlite"
         backup_remote = "/data/local/tmp/keystore-snaptool-rollback.sqlite"
 
-        self.adb.adb(["push", str(merged_sqlite_local_path), remote_merged], check=True)
+        self.adb.adb(
+            ["push", str(merged_sqlite_local_path), remote_merged],
+            critical=True,
+            phase="restore: push merged keystore DB",
+            reason="could not push merged keystore DB to device",
+        )
 
         qm = shlex.quote(remote_merged)
         qb = shlex.quote(backup_remote)
@@ -308,7 +387,15 @@ rm -f {qm} 2>/dev/null || true
 exit
 exit
 """
-        self.adb.shell_script(script, allow_fail=True)
+        try:
+            self.adb.shell_script(
+                script,
+                critical=True,
+                phase="restore: per-UID keystore swap",
+                reason="could not apply per-UID keystore merge on device",
+            )
+        finally:
+            self._restart_keystore_safety_net()
 
     # ---------------- NEW: keystore2 + locksettings fixups ----------------
     def _keystore_locksettings_fixups(self, device_tar: str) -> None:
@@ -409,7 +496,15 @@ exit
             "",
         ]
 
-        self.adb.shell_script("\n".join(lines), allow_fail=True)
+        try:
+            self.adb.shell_script(
+                "\n".join(lines),
+                critical=True,
+                phase="restore: keystore/locksettings fixups",
+                reason="could not restore keystore/locksettings on device",
+            )
+        finally:
+            self._restart_keystore_safety_net()
 
     def exec_restore_path(
         self,
@@ -423,8 +518,14 @@ exit
     ) -> None:
         ch = self.cfg.chunk_size
 
+        self.adb.ensure_device_online(phase="restore-path: preflight")
         self.logger.info("Pushing temp tar to device...")
-        self.adb.adb(["push", str(local_tar), device_tar], check=True)
+        self.adb.adb(
+            ["push", str(local_tar), device_tar],
+            critical=True,
+            phase="restore-path: push tar",
+            reason="could not push restore tar to device",
+        )
 
         # ---------------- Stage 1: media/files first ----------------
         media_bak_map = "/data/local/tmp/media_bak_map.txt"
@@ -433,7 +534,8 @@ exit
 
         for i in range(0, len(plan.media_paths), ch):
             chunk_paths = plan.media_paths[i:i + ch]
-            self.logger.info("[Stage 1] Extracting chunk %d (%d paths)...", i // ch + 1, len(chunk_paths))
+            chunk_no = i // ch + 1
+            self.logger.info("[Stage 1] Extracting chunk %d (%d paths)...", chunk_no, len(chunk_paths))
 
             prep_lines = []
             map_lines = []
@@ -452,7 +554,9 @@ exit
             map_payload = "\n".join(map_lines) + "\n"
             self.adb.shell_script(
                 f"su\ncat > {shlex.quote(media_bak_map)} <<'EOF'\n{map_payload}EOF\nexit\nexit\n",
-                allow_fail=True,
+                critical=True,
+                phase=f"restore-path: write media bak-map (chunk {chunk_no})",
+                reason="could not write media restore map to device",
             )
 
             prep_blob = "\n".join(prep_lines)
@@ -494,7 +598,12 @@ fi
 exit
 exit
 """
-            self.adb.shell_script(script, allow_fail=True)
+            self.adb.shell_script(
+                script,
+                critical=True,
+                phase=f"restore-path: extract media chunk {chunk_no}",
+                reason="could not extract media chunk on device",
+            )
 
         # ---------------- Stage 2: apps after files ----------------
         if plan.app_paths:
@@ -515,7 +624,12 @@ exit
             for uid2, pkg in unique_pairs:
                 lines.append(f'am force-stop --user {uid2} {shlex.quote(pkg)} >/dev/null 2>&1 || true')
             lines += ["exit", "exit"]
-            self.adb.shell_script("\n".join(lines) + "\n", allow_fail=True)
+            self.adb.shell_script(
+                "\n".join(lines) + "\n",
+                critical=True,
+                phase="restore-path: force-stop apps before extraction",
+                reason="could not stop apps before extraction (extraction would race with running apps)",
+            )
 
         # Replay runtime permissions/appops before framework stop/start so restore
         # is not blocked by lock-screen state after restart.
@@ -527,24 +641,24 @@ exit
                 apply_revokes=runtime_apply_revokes,
             )
 
-        self._stop_framework_best_effort()
+        with self._framework_stopped():
+            for i in range(0, len(plan.app_paths), ch):
+                chunk_paths = plan.app_paths[i:i + ch]
+                chunk_no = i // ch + 1
+                self.logger.info("[Stage 2] Extracting chunk %d (%d paths)...", chunk_no, len(chunk_paths))
 
-        for i in range(0, len(plan.app_paths), ch):
-            chunk_paths = plan.app_paths[i:i + ch]
-            self.logger.info("[Stage 2] Extracting chunk %d (%d paths)...", i // ch + 1, len(chunk_paths))
+                prep_lines = []
+                for p in chunk_paths:
+                    parsed = self._parse_uid_pkg_from_path(p)
+                    if not parsed:
+                        continue
+                    uid2, pkg = parsed
+                    if p.startswith("data/user/") or p.startswith("data/user_de/"):
+                        prep_lines.append(f'rm -rf /data/user/{uid2}/{shlex.quote(pkg)} >/dev/null 2>&1 || true')
+                        prep_lines.append(f'rm -rf /data/user_de/{uid2}/{shlex.quote(pkg)} >/dev/null 2>&1 || true')
 
-            prep_lines = []
-            for p in chunk_paths:
-                parsed = self._parse_uid_pkg_from_path(p)
-                if not parsed:
-                    continue
-                uid2, pkg = parsed
-                if p.startswith("data/user/") or p.startswith("data/user_de/"):
-                    prep_lines.append(f'rm -rf /data/user/{uid2}/{shlex.quote(pkg)} >/dev/null 2>&1 || true')
-                    prep_lines.append(f'rm -rf /data/user_de/{uid2}/{shlex.quote(pkg)} >/dev/null 2>&1 || true')
-
-            joined = " ".join(shlex.quote(p) for p in chunk_paths)
-            script = f"""
+                joined = " ".join(shlex.quote(p) for p in chunk_paths)
+                script = f"""
 su
 cd /
 {chr(10).join(prep_lines)}
@@ -552,29 +666,34 @@ tar -xpf {device_tar} {joined} || true
 exit
 exit
 """
-            self.adb.shell_script(script, allow_fail=True)
+                self.adb.shell_script(
+                    script,
+                    critical=True,
+                    phase=f"restore-path: extract app chunk {chunk_no}",
+                    reason="could not extract app data chunk on device",
+                )
 
-        # Per-UID keystore merge takes precedence over the legacy whole-DB tar
-        # extraction. Newer snapshots ship keystore_rows.json; older ones still
-        # rely on /data/misc/keystore inside the tar (SDK <34 only).
-        if keystore_merged_local_path is not None:
-            self._keystore_per_uid_fixup(keystore_merged_local_path)
-        else:
-            self._keystore_locksettings_fixups(device_tar)
+            # Per-UID keystore merge takes precedence over the legacy whole-DB tar
+            # extraction. Newer snapshots ship keystore_rows.json; older ones still
+            # rely on /data/misc/keystore inside the tar (SDK <34 only).
+            if keystore_merged_local_path is not None:
+                self._keystore_per_uid_fixup(keystore_merged_local_path)
+            else:
+                self._keystore_locksettings_fixups(device_tar)
 
-        # AccountManager DB replace + perms/contexts
-        self._accountmanager_fixups(plan.user_ids, device_tar)
-        self._permission_state_file_fixups(plan.user_ids)
+            # AccountManager DB replace + perms/contexts
+            self._accountmanager_fixups(plan.user_ids, device_tar)
+            self._permission_state_file_fixups(plan.user_ids)
 
-        self.logger.info("Post-stage: restorecon + start framework (best-effort) ...")
-        self.adb.shell_script(
-            "su\nsync\n"
-            "if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/user /data/user_de >/dev/null 2>&1 || true; fi\n"
-            "exit\nexit\n",
-            allow_fail=True,
-        )
-
-        self._start_framework_best_effort()
+            self.logger.info("Post-stage: restorecon /data/user /data/user_de ...")
+            self.adb.shell_script(
+                "su\nsync\n"
+                "if command -v restorecon >/dev/null 2>&1; then restorecon -RF /data/user /data/user_de >/dev/null 2>&1 || true; fi\n"
+                "exit\nexit\n",
+                critical=True,
+                phase="restore-path: restorecon /data/user",
+                reason="could not restore SELinux contexts on /data/user (apps would be unable to read their data)",
+            )
 
         if runtime_state:
             self.logger.info("Post-stage: re-applying runtime state after framework restart ...")
@@ -584,7 +703,7 @@ exit
                 apply_revokes=runtime_apply_revokes,
             )
 
-        # Fixups (kept)
+        # Media owner/SELinux fixup after framework restart.
         fix_lines = ["su", "cd /"]
         for uid in plan.user_ids:
             fix_lines.append(f'chown -R media_rw:media_rw /data/media/{uid} >/dev/null 2>&1 || true')
@@ -596,9 +715,14 @@ exit
             fix_lines.append(f'am force-stop --user {uid} com.android.providers.media >/dev/null 2>&1 || true')
             fix_lines.append(f'am force-stop --user {uid} com.google.android.apps.photos >/dev/null 2>&1 || true')
         fix_lines += ["exit", "exit"]
-        self.adb.shell_script("\n".join(fix_lines) + "\n", allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(fix_lines) + "\n",
+            critical=True,
+            phase="restore-path: media owner/SELinux fixup",
+            reason="could not restore media ownership/SELinux contexts (apps would be unable to read media)",
+        )
 
-        # Photos permissions (kept)
+        # Photos permissions (best-effort: idempotent, app-level).
         perm = ["su", "set -e", ""]
         for uid in plan.user_ids:
             perm += [
@@ -607,9 +731,13 @@ exit
                 f'pm grant --user {uid} {plan.photos_pkg} android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true',
             ]
         perm += ["exit", "exit"]
-        self.adb.shell_script("\n".join(perm) + "\n", allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(perm) + "\n",
+            critical=False,
+            phase="restore-path: photos permissions (best-effort)",
+        )
 
-        # Ensure SystemUI not stopped (kept)
+        # Ensure SystemUI not stopped (best-effort: re-runnable, idempotent).
         ui = ["su"]
         for uid in plan.user_ids:
             ui += [
@@ -618,12 +746,16 @@ exit
                 f'am set-stopped-state --user {uid} {plan.systemui_pkg} false >/dev/null 2>&1 || true',
             ]
         ui += ["exit", "exit"]
-        self.adb.shell_script("\n".join(ui) + "\n", allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(ui) + "\n",
+            critical=False,
+            phase="restore-path: ensure SystemUI enabled (best-effort)",
+        )
 
-        # Safe refresh (kept)
+        # Safe refresh (best-effort).
         self._safe_media_refresh(plan)
 
-        # Cleanup device tar
+        # Cleanup device tar (best-effort).
         self.adb.shell_root(f"rm -f {shlex.quote(device_tar)}", check=False)
 
     def exec_restore_app(
@@ -667,8 +799,14 @@ exit
             len(app_paths),
             include_account_db,
         )
+        self.adb.ensure_device_online(phase="restore-app: preflight")
         self.logger.info("Pushing temp tar to device...")
-        self.adb.adb(["push", str(local_tar), device_tar], check=True)
+        self.adb.adb(
+            ["push", str(local_tar), device_tar],
+            critical=True,
+            phase="restore-app: push tar",
+            reason="could not push restore tar to device",
+        )
 
         all_pairs = []
         all_seen = set()
@@ -683,7 +821,12 @@ exit
             for uid, pkg in all_pairs:
                 force_lines.append(f'am force-stop --user {uid} {shlex.quote(pkg)} >/dev/null 2>&1 || true')
             force_lines += ["exit", "exit"]
-            self.adb.shell_script("\n".join(force_lines) + "\n", allow_fail=True)
+            self.adb.shell_script(
+                "\n".join(force_lines) + "\n",
+                critical=True,
+                phase="restore-app: force-stop apps before extraction",
+                reason="could not stop apps before extraction (extraction would race with running apps)",
+            )
         else:
             self.logger.warning("No app data roots from snapshot match requested package/auth packages.")
 
@@ -695,60 +838,62 @@ exit
                 apply_revokes=True,
             )
 
-        if include_account_db:
-            self._stop_framework_best_effort()
+        from contextlib import nullcontext
+        framework_ctx = self._framework_stopped() if include_account_db else nullcontext()
 
-        for i in range(0, len(app_paths), ch):
-            chunk_paths = app_paths[i:i + ch]
-            self.logger.info("App restore chunk %d (%d paths)...", i // ch + 1, len(chunk_paths))
+        with framework_ctx:
+            for i in range(0, len(app_paths), ch):
+                chunk_paths = app_paths[i:i + ch]
+                chunk_no = i // ch + 1
+                self.logger.info("App restore chunk %d (%d paths)...", chunk_no, len(chunk_paths))
 
-            unique_pairs = []
-            seen_pairs = set()
-            for p in chunk_paths:
-                parsed = self._parse_uid_pkg_from_path(p)
-                if parsed and parsed not in seen_pairs:
-                    seen_pairs.add(parsed)
-                    unique_pairs.append(parsed)
+                unique_pairs = []
+                seen_pairs = set()
+                for p in chunk_paths:
+                    parsed = self._parse_uid_pkg_from_path(p)
+                    if parsed and parsed not in seen_pairs:
+                        seen_pairs.add(parsed)
+                        unique_pairs.append(parsed)
 
-            prep_lines = []
-            fix_owner_lines = []
-            fix_ctx_lines = []
-            owner_idx = 0
-            ctx_idx = 0
-            for uid2, pkg in unique_pairs:
-                owner_var = f"O{owner_idx}"
-                owner_idx += 1
-                ctx_var = f"C{ctx_idx}"
-                ctx_idx += 1
-                quoted_pkg = shlex.quote(pkg)
-                prep_lines += [
-                    # Capture current app UID:GID before deletion so restored files keep app ownership.
-                    f'{owner_var}="$(stat -c \'%u:%g\' /data/user/{uid2}/{quoted_pkg} 2>/dev/null || stat -c \'%u:%g\' /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null || true)"',
-                    f'if [ -z "${owner_var}" ] && [ -f /data/system/packages.list ]; then '
-                    f'{owner_var}="$(awk \'$1==\\"{pkg}\\" {{print $2 ":" $2; exit}}\' /data/system/packages.list 2>/dev/null || true)"; fi',
-                    # Capture current SELinux app-data label (includes category set on most builds).
-                    f'{ctx_var}="$(ls -Zd /data/user/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || ls -Zd /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || true)"',
-                    f'rm -rf /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'rm -rf /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'rm -rf /data/media/{uid2}/Android/data/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'rm -rf /data/media/{uid2}/Android/media/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'rm -rf /data/media/{uid2}/Android/obb/{quoted_pkg} >/dev/null 2>&1 || true',
-                ]
-                fix_owner_lines += [
-                    f'if [ -n "${owner_var}" ]; then',
-                    f'  chown -R "${owner_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'  chown -R "${owner_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'fi',
-                ]
-                fix_ctx_lines += [
-                    f'if [ -n "${ctx_var}" ] && command -v chcon >/dev/null 2>&1; then',
-                    f'  chcon -R "${ctx_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'  chcon -R "${ctx_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
-                    f'fi',
-                ]
+                prep_lines = []
+                fix_owner_lines = []
+                fix_ctx_lines = []
+                owner_idx = 0
+                ctx_idx = 0
+                for uid2, pkg in unique_pairs:
+                    owner_var = f"O{owner_idx}"
+                    owner_idx += 1
+                    ctx_var = f"C{ctx_idx}"
+                    ctx_idx += 1
+                    quoted_pkg = shlex.quote(pkg)
+                    prep_lines += [
+                        # Capture current app UID:GID before deletion so restored files keep app ownership.
+                        f'{owner_var}="$(stat -c \'%u:%g\' /data/user/{uid2}/{quoted_pkg} 2>/dev/null || stat -c \'%u:%g\' /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null || true)"',
+                        f'if [ -z "${owner_var}" ] && [ -f /data/system/packages.list ]; then '
+                        f'{owner_var}="$(awk \'$1==\\"{pkg}\\" {{print $2 ":" $2; exit}}\' /data/system/packages.list 2>/dev/null || true)"; fi',
+                        # Capture current SELinux app-data label (includes category set on most builds).
+                        f'{ctx_var}="$(ls -Zd /data/user/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || ls -Zd /data/user_de/{uid2}/{quoted_pkg} 2>/dev/null | awk \'{{print $1}}\' || true)"',
+                        f'rm -rf /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'rm -rf /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'rm -rf /data/media/{uid2}/Android/data/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'rm -rf /data/media/{uid2}/Android/media/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'rm -rf /data/media/{uid2}/Android/obb/{quoted_pkg} >/dev/null 2>&1 || true',
+                    ]
+                    fix_owner_lines += [
+                        f'if [ -n "${owner_var}" ]; then',
+                        f'  chown -R "${owner_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'  chown -R "${owner_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'fi',
+                    ]
+                    fix_ctx_lines += [
+                        f'if [ -n "${ctx_var}" ] && command -v chcon >/dev/null 2>&1; then',
+                        f'  chcon -R "${ctx_var}" /data/user/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'  chcon -R "${ctx_var}" /data/user_de/{uid2}/{quoted_pkg} >/dev/null 2>&1 || true',
+                        f'fi',
+                    ]
 
-            joined = " ".join(shlex.quote(p) for p in chunk_paths)
-            script = f"""
+                joined = " ".join(shlex.quote(p) for p in chunk_paths)
+                script = f"""
 su
 cd /
 {chr(10).join(prep_lines)}
@@ -758,31 +903,38 @@ tar -xpf {device_tar} {joined} >/dev/null 2>&1 || true
 exit
 exit
 """
-            self.adb.shell_script(script, allow_fail=True)
+                self.adb.shell_script(
+                    script,
+                    critical=True,
+                    phase=f"restore-app: extract chunk {chunk_no}",
+                    reason="could not extract app data chunk on device",
+                )
 
-        if include_account_db:
-            if keystore_merged_local_path is not None:
-                self._keystore_per_uid_fixup(keystore_merged_local_path)
-            else:
-                self._keystore_locksettings_fixups(device_tar)
-            self._accountmanager_fixups(user_ids, device_tar)
+            if include_account_db:
+                if keystore_merged_local_path is not None:
+                    self._keystore_per_uid_fixup(keystore_merged_local_path)
+                else:
+                    self._keystore_locksettings_fixups(device_tar)
+                self._accountmanager_fixups(user_ids, device_tar)
 
-        restorecon_lines = ["su", "sync"]
-        restorecon_lines.append("if command -v restorecon >/dev/null 2>&1; then")
-        for uid in user_ids:
-            for pkg in pkgs:
-                restorecon_lines += [
-                    f'  restorecon -RF /data/user/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
-                    f'  restorecon -RF /data/user_de/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
-                    f'  restorecon -RF /data/media/{uid}/Android/data/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
-                    f'  restorecon -RF /data/media/{uid}/Android/media/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
-                    f'  restorecon -RF /data/media/{uid}/Android/obb/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
-                ]
-        restorecon_lines += ["fi", "exit", "exit", ""]
-        self.adb.shell_script("\n".join(restorecon_lines), allow_fail=True)
-
-        if include_account_db:
-            self._start_framework_best_effort()
+            restorecon_lines = ["su", "sync"]
+            restorecon_lines.append("if command -v restorecon >/dev/null 2>&1; then")
+            for uid in user_ids:
+                for pkg in pkgs:
+                    restorecon_lines += [
+                        f'  restorecon -RF /data/user/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                        f'  restorecon -RF /data/user_de/{uid}/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                        f'  restorecon -RF /data/media/{uid}/Android/data/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                        f'  restorecon -RF /data/media/{uid}/Android/media/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                        f'  restorecon -RF /data/media/{uid}/Android/obb/{shlex.quote(pkg)} >/dev/null 2>&1 || true',
+                    ]
+            restorecon_lines += ["fi", "exit", "exit", ""]
+            self.adb.shell_script(
+                "\n".join(restorecon_lines),
+                critical=True,
+                phase="restore-app: restorecon app dirs",
+                reason="could not restore SELinux contexts on app data (apps would be unable to read their data)",
+            )
 
         if runtime_state:
             self.logger.info("Post-stage: re-applying runtime state after framework restart ...")
@@ -805,7 +957,12 @@ tar -xpf {device_tar} data || true
 exit
 exit
 """
-        self.adb.shell_script(script, allow_fail=True)
+        self.adb.shell_script(
+            script,
+            critical=True,
+            phase="restore-full: extract /data",
+            reason="could not extract /data on device",
+        )
 
     def _accountmanager_fixups(self, user_ids: list[int], device_tar: str) -> None:
         """
@@ -853,4 +1010,9 @@ exit
             ]
 
         lines += ["sync", "exit", "exit", ""]
-        self.adb.shell_script("\n".join(lines), allow_fail=True)
+        self.adb.shell_script(
+            "\n".join(lines),
+            critical=True,
+            phase="restore: accountmanager DB swap",
+            reason="could not replace AccountManager DBs on device",
+        )
