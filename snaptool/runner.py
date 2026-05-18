@@ -47,16 +47,21 @@ class SnaptoolAbortedError(Exception):
 # meaning every subsequent command will also fail until reconnect. These are
 # emitted by the local `adb` binary (not the device) and look the same whether
 # the call was best-effort or critical.
+# The `adb` binary emits these messages with either an `error:` or `adb:`
+# prefix depending on the call (push, pull, shell, etc.) and the platform
+# (linux, macos, win). Match both prefixes so we don't silently miss a
+# transport drop — historically the `adb:` variant slipped through and
+# disabled the retry loop entirely.
 _TRANSPORT_PATTERNS = [
-    re.compile(r"error:\s*device\s+'[^']*'\s+not found", re.IGNORECASE),
-    re.compile(r"error:\s*no devices/emulators? found", re.IGNORECASE),
-    re.compile(r"error:\s*device offline", re.IGNORECASE),
-    re.compile(r"error:\s*device not found", re.IGNORECASE),
-    re.compile(r"error:\s*closed", re.IGNORECASE),
-    re.compile(r"error:\s*protocol fault", re.IGNORECASE),
-    re.compile(r"adb:\s*device unauthorized", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*device\s+'[^']*'\s+not found", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*no devices/emulators? found", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*device offline", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*device not found", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*closed", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*protocol fault", re.IGNORECASE),
+    re.compile(r"(?:error|adb):\s*device unauthorized", re.IGNORECASE),
     re.compile(r"cannot connect to daemon", re.IGNORECASE),
-    re.compile(r"adb server.*killed", re.IGNORECASE),
+    re.compile(r"adb server.*kill", re.IGNORECASE),  # matches "killed" and "killing"
     re.compile(r"failed to (?:read|write).*Connection reset", re.IGNORECASE),
     re.compile(r"insufficient permissions for device", re.IGNORECASE),
 ]

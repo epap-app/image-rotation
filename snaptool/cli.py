@@ -19,6 +19,7 @@ from . import keystore_merge
 from .logging_setup import setup_logging
 from .planner import RestorePlan, RestorePlanner
 from .policy import RestorePolicy
+from .restore_state import RESTORE_STATE_PATH, RestoreState
 from .runner import SnaptoolAbortedError, run_checked
 from .tar_index import TarIndexer
 
@@ -1076,6 +1077,7 @@ def cmd_backup(args) -> int:
 
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "backup.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="backup: root preflight")
 
     device_tar = "/data/local/tmp/data-backup.tar"
     local_tar = paths.snap_dir / "data.tar"
@@ -1154,6 +1156,7 @@ def cmd_backup_thirdparty(args) -> int:
 
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "backup-thirdparty.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="backup-thirdparty: root preflight")
     state = AndroidStateReader(adb, logger)
 
     if args.user:
@@ -1362,6 +1365,7 @@ def cmd_backup_app(args) -> int:
 
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "backup-app.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="backup-app: root preflight")
     state = AndroidStateReader(adb, logger)
 
     user_ids = _resolve_users_for_package(state, package, args.user or [])
@@ -1481,6 +1485,7 @@ def cmd_restore_path(args) -> int:
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "restore-path.log")
 
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="restore-path: root preflight")
 
     logger.info("Using snapshot: %s", paths.snap_dir)
     logger.info("Decompressing zstd archive -> temp tar...")
@@ -1617,6 +1622,7 @@ def cmd_restore_app(args) -> int:
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "restore-app.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="restore-app: root preflight")
 
     meta = _read_app_meta(paths.snap_dir / APP_META_FILE)
     package = args.package or meta.get("package")
@@ -1732,6 +1738,20 @@ def cmd_restore_app(args) -> int:
     return 0
 
 
+def _refusal_message(state: dict) -> str:
+    return (
+        "Refusing to restore: device is in a half-restored state from a previous run.\n"
+        f"{RestoreState.format_for_user(state)}\n"
+        "Options:\n"
+        "  1. snaptool recover-thirdparty\n"
+        "       re-run the marked snapshot to completion (recommended)\n"
+        "  2. snaptool restore-thirdparty --force-clean <snapshot>\n"
+        "       ignore marker and proceed anyway (risky — may compound damage)\n"
+        "  3. snaptool clear-restore-state\n"
+        "       just delete the marker (only if you have verified the device is healthy)"
+    )
+
+
 def cmd_restore_thirdparty(args) -> int:
     cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
     paths = SnapshotPaths.for_snapshot(cfg.snap_root, args.snapshot)
@@ -1742,6 +1762,28 @@ def cmd_restore_thirdparty(args) -> int:
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "restore-thirdparty.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="restore-thirdparty: root preflight")
+
+    # Preflight: refuse to start on top of a half-restored device unless the
+    # operator explicitly chose what to do about it.
+    force_clean = bool(getattr(args, "force_clean", False))
+    existing_marker = RestoreState.read_remote(adb, logger)
+    if existing_marker is not None:
+        prior_snap = existing_marker.get("snapshot")
+        if force_clean:
+            logger.warning(
+                "Existing restore-state marker present (snapshot=%s); --force-clean set, proceeding.",
+                prior_snap,
+            )
+        elif prior_snap == args.snapshot:
+            logger.warning(
+                "Existing restore-state marker matches current snapshot '%s'; "
+                "treating this as a recovery and continuing.",
+                prior_snap,
+            )
+        else:
+            logger.error(_refusal_message(existing_marker))
+            return 3
 
     meta = _read_json_dict(paths.snap_dir / APPS_META_FILE)
     if not meta:
@@ -1864,6 +1906,14 @@ def cmd_restore_thirdparty(args) -> int:
 
     keystore_merged = _prepare_keystore_merged_db(adb, paths.snap_dir, logger)
 
+    restore_state = RestoreState(
+        adb=adb,
+        snapshot=args.snapshot,
+        cmd="restore-thirdparty",
+        snap_root=str(cfg.snap_root),
+        logger=logger,
+    )
+
     try:
         execu.exec_restore_path(
             plan,
@@ -1872,6 +1922,7 @@ def cmd_restore_thirdparty(args) -> int:
             runtime_state=runtime_state,
             runtime_apply_revokes=True,
             keystore_merged_local_path=keystore_merged,
+            restore_state=restore_state,
         )
     finally:
         if keystore_merged is not None:
@@ -1880,6 +1931,10 @@ def cmd_restore_thirdparty(args) -> int:
             except FileNotFoundError:
                 pass
 
+    # Only reached on success — exec_restore_path raises on abort, and the
+    # finally above doesn't swallow it. Mark the device as cleanly restored.
+    restore_state.clear()
+
     logger.info("Cleaning up host temp tar...")
     try:
         paths.temp_tar.unlink()
@@ -1887,6 +1942,100 @@ def cmd_restore_thirdparty(args) -> int:
         pass
 
     logger.info("Restore-thirdparty complete.")
+    return 0
+
+
+def cmd_recover_thirdparty(args) -> int:
+    """Re-run the snapshot named by the device's restore-state marker.
+
+    Recovery for an aborted restore-thirdparty just means: re-execute the
+    same snapshot against the device. Snapshot restore is structurally
+    `rm -rf <pkg> && tar -xpf <pkg>` per package, so re-running converges
+    to the snapshot's intended state regardless of what was on the device
+    before.
+    """
+    cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
+    logger = setup_logging(cfg.verbose, log_file=None)
+    adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="recover-thirdparty: root preflight")
+
+    state = RestoreState.read_remote(adb, logger)
+    if state is None:
+        logger.info("No restore-state marker on device; nothing to recover.")
+        return 0
+
+    snap = state.get("snapshot")
+    cmd = state.get("cmd")
+    if not snap or snap == "<unparseable>":
+        logger.error(
+            "Marker is present but has no usable snapshot name. Inspect manually:\n%s",
+            RestoreState.format_for_user(state),
+        )
+        return 1
+    if cmd != "restore-thirdparty":
+        logger.error(
+            "Marker is from command '%s', not 'restore-thirdparty'. Recovery for "
+            "this command is not implemented yet.\n%s",
+            cmd,
+            RestoreState.format_for_user(state),
+        )
+        return 1
+
+    paths = SnapshotPaths.for_snapshot(cfg.snap_root, snap)
+    if not paths.archive_zst.is_file():
+        logger.error(
+            "Marker references snapshot '%s' but archive is missing at %s. "
+            "Either restore the archive on the host or run `clear-restore-state` "
+            "if you know the device is healthy.",
+            snap,
+            paths.archive_zst,
+        )
+        return 1
+
+    logger.warning(
+        "Recovering: re-running `restore-thirdparty %s` with --force-clean. "
+        "Marker reports prior run reached phase '%s' (phase #%s).",
+        snap,
+        state.get("last_phase", "?"),
+        state.get("phase_count", "?"),
+    )
+
+    rec = argparse.Namespace(
+        snapshot=snap,
+        serial=args.serial,
+        snap_root=args.snap_root,
+        verbose=args.verbose,
+        user=None,
+        auth_pkg=None,
+        force_clean=True,
+    )
+    return cmd_restore_thirdparty(rec)
+
+
+def cmd_clear_restore_state(args) -> int:
+    """Delete the device-side restore-state marker. For use when the operator
+    has verified the device is healthy and just wants to dismiss the safety
+    block on subsequent restores."""
+    cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
+    logger = setup_logging(cfg.verbose, log_file=None)
+    adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="clear-restore-state: root preflight")
+
+    state = RestoreState.read_remote(adb, logger)
+    if state is None:
+        logger.info("No restore-state marker on device; nothing to clear.")
+        return 0
+
+    logger.warning(
+        "Clearing restore-state marker:\n%s",
+        RestoreState.format_for_user(state),
+    )
+    adb.shell_root(
+        f"rm -f {RESTORE_STATE_PATH}",
+        critical=False,
+        phase="clear-restore-state",
+    )
+    logger.info("Restore-state marker cleared.")
     return 0
 
 
@@ -2148,7 +2297,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Auth package data to restore (repeatable). If omitted, uses snapshot metadata/defaults",
     )
+    p_restore_tp.add_argument(
+        "--force-clean",
+        action="store_true",
+        default=False,
+        help=(
+            "Ignore any existing restore-state marker on the device and proceed anyway. "
+            "Risky — use only if you know the device is in a clean state."
+        ),
+    )
     p_restore_tp.set_defaults(func=cmd_restore_thirdparty)
+
+    p_recover_tp = sub.add_parser(
+        "recover-thirdparty",
+        help="Recover from a half-restored restore-thirdparty by re-running the marked snapshot",
+    )
+    p_recover_tp.set_defaults(func=cmd_recover_thirdparty)
+
+    p_clear_state = sub.add_parser(
+        "clear-restore-state",
+        help="Delete the device-side restore-state marker (use only after verifying the device is healthy)",
+    )
+    p_clear_state.set_defaults(func=cmd_clear_restore_state)
 
     p_pairip = sub.add_parser(
         "pairip-fix",

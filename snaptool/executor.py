@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import shlex
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from .adb import AdbClient
 from .planner import RestorePlan
+from .restore_state import RestoreState
 from .runner import SnaptoolAbortedError
 from .tar_index import TarIndex
 
@@ -128,9 +130,18 @@ class RestoreExecutor:
         restart still runs in a `finally` so we don't leave the device with
         zygote dead. A failure of the restart itself is logged loudly but
         swallowed, so it doesn't mask the original error.
+
+        Also verifies root remains available at both transitions. On some
+        Magisk setups, magiskd can die alongside zygote during framework
+        stop and not come back cleanly after restart — without the check
+        the body would silently no-op via the `|| true` pattern in every
+        shell script and the tool would falsely report success.
         """
         self._stop_framework_best_effort()
         try:
+            # Root must still work for the body (extract, swap DBs, etc.).
+            # If this raises, the finally below still attempts restart.
+            self.adb.ensure_root(phase="restore: root check after framework stop")
             yield
         finally:
             try:
@@ -145,6 +156,28 @@ class RestoreExecutor:
                 self.logger.error(
                     "FRAMEWORK RESTART FAILED (unexpected) after restore exit; "
                     "device may not boot until manual reboot. (%s)",
+                    exc,
+                )
+            # Post-restart root check. If the body raised, only LOG so we
+            # don't mask the original exception. If the body succeeded,
+            # raise — root being gone post-restart means subsequent
+            # post-restore fixups (perms, appops, restorecon) would
+            # silently fail; better to surface that as an abort.
+            body_already_raised = sys.exc_info()[0] is not None
+            try:
+                self.adb.ensure_root(phase="restore: root check after framework restart")
+            except SnaptoolAbortedError as exc:
+                if body_already_raised:
+                    self.logger.error(
+                        "ROOT UNAVAILABLE after framework restart (also): %s. "
+                        "Post-restore fixups cannot run on this device.",
+                        exc,
+                    )
+                else:
+                    raise
+            except Exception as exc:
+                self.logger.error(
+                    "ROOT CHECK FAILED unexpectedly after framework restart: %s",
                     exc,
                 )
 
@@ -515,6 +548,7 @@ exit
         runtime_apply_revokes: bool = False,
         device_tar: str = "/data/local/tmp/restore.tar",
         keystore_merged_local_path: Path | None = None,
+        restore_state: RestoreState | None = None,
     ) -> None:
         ch = self.cfg.chunk_size
 
@@ -526,6 +560,9 @@ exit
             phase="restore-path: push tar",
             reason="could not push restore tar to device",
         )
+
+        if restore_state is not None:
+            restore_state.begin()
 
         # ---------------- Stage 1: media/files first ----------------
         media_bak_map = "/data/local/tmp/media_bak_map.txt"
@@ -605,6 +642,9 @@ exit
                 reason="could not extract media chunk on device",
             )
 
+        if restore_state is not None and plan.media_paths:
+            restore_state.update_phase("media_extracted")
+
         # ---------------- Stage 2: apps after files ----------------
         if plan.app_paths:
             self.logger.info("Stage 2/2: Restoring apps AFTER files... (%d paths)", len(plan.app_paths))
@@ -673,6 +713,9 @@ exit
                     reason="could not extract app data chunk on device",
                 )
 
+            if restore_state is not None and plan.app_paths:
+                restore_state.update_phase("apps_extracted")
+
             # Per-UID keystore merge takes precedence over the legacy whole-DB tar
             # extraction. Newer snapshots ship keystore_rows.json; older ones still
             # rely on /data/misc/keystore inside the tar (SDK <34 only).
@@ -680,10 +723,17 @@ exit
                 self._keystore_per_uid_fixup(keystore_merged_local_path)
             else:
                 self._keystore_locksettings_fixups(device_tar)
+            if restore_state is not None:
+                restore_state.update_phase("keystore_done")
 
             # AccountManager DB replace + perms/contexts
             self._accountmanager_fixups(plan.user_ids, device_tar)
+            if restore_state is not None:
+                restore_state.update_phase("accountmgr_done")
+
             self._permission_state_file_fixups(plan.user_ids)
+            if restore_state is not None:
+                restore_state.update_phase("perm_fixups_done")
 
             self.logger.info("Post-stage: restorecon /data/user /data/user_de ...")
             self.adb.shell_script(
@@ -694,6 +744,14 @@ exit
                 phase="restore-path: restorecon /data/user",
                 reason="could not restore SELinux contexts on /data/user (apps would be unable to read their data)",
             )
+            if restore_state is not None:
+                restore_state.update_phase("restorecon_done")
+
+        # `with _framework_stopped()` has exited cleanly → framework restart
+        # already ran. Mark it so an aborted post-restore phase still tells
+        # the operator the framework is up.
+        if restore_state is not None:
+            restore_state.update_phase("framework_restarted")
 
         if runtime_state:
             self.logger.info("Post-stage: re-applying runtime state after framework restart ...")
@@ -721,6 +779,8 @@ exit
             phase="restore-path: media owner/SELinux fixup",
             reason="could not restore media ownership/SELinux contexts (apps would be unable to read media)",
         )
+        if restore_state is not None:
+            restore_state.update_phase("media_owner_done")
 
         # Photos permissions (best-effort: idempotent, app-level).
         perm = ["su", "set -e", ""]

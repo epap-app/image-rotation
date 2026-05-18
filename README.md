@@ -10,6 +10,8 @@ Supported commands:
 - `restore-path` - restore from full snapshot with package scope filtering
 - `restore-app` - restore one app snapshot
 - `restore-thirdparty` - restore a `backup-thirdparty` snapshot
+- `recover-thirdparty` - re-run the snapshot named by the device's restore-state marker (recovery for a half-restored `restore-thirdparty`)
+- `clear-restore-state` - delete the device-side restore-state marker (use only after verifying the device is healthy)
 - `pairip-fix` - install the AlterInstaller Magisk module, write `/data/local/tmp/AlterInstaller.json`, and reboot
 
 ## Requirements
@@ -204,10 +206,12 @@ python3 recovery_tool.py restore-app netto_fixed --with-account-db
 
 Restores a snapshot created by `backup-thirdparty`.
 
+Before starting, the command checks the device for a `/data/local/tmp/snaptool-restore.state` marker left by a previous aborted run. If a marker exists and references a *different* snapshot, the command refuses to start (exit code 3) and prints the operator's three recovery options. See [Resilience & Recovery](#resilience--recovery) below.
+
 Usage:
 
 ```bash
-python3 recovery_tool.py restore-thirdparty <snapshot> [--user USER ...] [--auth-pkg PKG ...]
+python3 recovery_tool.py restore-thirdparty <snapshot> [--user USER ...] [--auth-pkg PKG ...] [--force-clean]
 ```
 
 Options:
@@ -215,6 +219,7 @@ Options:
 - `snapshot` - required snapshot name
 - `--user USER` - repeatable, limit restore to selected users
 - `--auth-pkg PKG` - repeatable, override auth packages for restore
+- `--force-clean` - ignore any existing restore-state marker on the device and proceed anyway (risky — may compound damage from a previously half-restored device)
 
 Examples:
 
@@ -223,9 +228,39 @@ python3 recovery_tool.py --verbose restore-thirdparty zero3party
 python3 recovery_tool.py restore-thirdparty zero3party --user 0
 python3 recovery_tool.py restore-thirdparty zero3party --user 0 --user 10
 python3 recovery_tool.py restore-thirdparty zero3party --auth-pkg com.example.auth
+python3 recovery_tool.py restore-thirdparty zero3party --force-clean
 ```
 
-### 7) `pairip-fix`
+### 7) `recover-thirdparty`
+
+Reads the device's restore-state marker and re-runs the snapshot it references (with `--force-clean`). Used when the previous `restore-thirdparty` aborted partway through — re-running the same snapshot converges the device to the snapshot's intended state regardless of how far the prior attempt got.
+
+If no marker is present, the command does nothing and returns 0. If the marker references a snapshot whose archive is missing on the host, it errors out so the operator can restore the archive (or run `clear-restore-state` if the device is known to be fine).
+
+Usage:
+
+```bash
+python3 recovery_tool.py recover-thirdparty
+```
+
+Examples:
+
+```bash
+python3 recovery_tool.py --verbose recover-thirdparty
+python3 recovery_tool.py --serial <device_serial> recover-thirdparty
+```
+
+### 8) `clear-restore-state`
+
+Deletes the device-side restore-state marker. Use this only after you have verified by hand that the device is in a healthy state — otherwise the next `restore-thirdparty` will run on top of a corrupt user space.
+
+Usage:
+
+```bash
+python3 recovery_tool.py clear-restore-state
+```
+
+### 9) `pairip-fix`
 
 Installs the bundled `assets/AlterInstaller-2.3-release.zip` Magisk module on the device, writes `/data/local/tmp/AlterInstaller.json` (replacing any existing file), and reboots the device.
 
@@ -271,6 +306,81 @@ On success, the device reboots and the tool prints:
 Pairip has been fixed successfully
 ```
 
+## Resilience & Recovery
+
+Backup and restore are long sequences of ADB commands. When the host↔device link blips mid-stream — bad USB cable, adbd restart, version-mismatch server bounce — naive tooling silently misses commands and continues, leaving the device with apps half-extracted, framework stopped, or keystore mid-swap. Stacking another restore on top of that state is what bricks devices.
+
+This tool defends against that in three layers:
+
+### Layer 1: Auto-retry on transient transport drops
+
+Every adb call (critical and best-effort) is wrapped in a transport-drop retry loop. When the local `adb` binary reports `adb: device offline`, `adb: no devices/emulators found`, `adb: closed`, `error: protocol fault`, version-mismatch server kill, or similar, the tool:
+
+1. Logs `[transport-retry] transport drop detected during phase '<phase>' (attempt N/3); waiting for device and retrying...`
+2. Runs `adb wait-for-device` with a 30s bounded timeout.
+3. Sends an `adb shell echo SNAPTOOL_PROBE_OK` probe to confirm the shell can actually execute (the probe does not depend on framework boot — works during the framework-stopped window).
+4. Sleeps 1–2s (progressive backoff) and retries the same command.
+
+Up to 2 retries (3 total attempts). Short USB blips are absorbed silently and the restore continues uninterrupted.
+
+### Layer 2: Abort on persistent failure
+
+If 3 attempts all fail, or if a critical adb command returns non-zero from the device shell, the tool aborts with:
+
+```
+restore-failed: <phase>: <reason> (lost adb connection | command failed, rc=<n>): <stderr excerpt>
+backup-failed: ...
+```
+
+Exit code is `2`. The framework-stopped and keystore-stopped windows have `try/finally` safety nets that always attempt to restart `zygote` / `keystore2` / `credstore` before the abort propagates, so a mid-restore failure does not leave services dead.
+
+### Layer 3: Device-side marker + recovery (restore-thirdparty only)
+
+`restore-thirdparty` writes `/data/local/tmp/snaptool-restore.state` once the tar push succeeds and updates it as each major phase completes (media extracted, apps extracted, keystore swapped, accountmanager swapped, restorecon done, framework restarted, media owner fixed). On clean exit the marker is deleted; on abort it remains.
+
+Every subsequent `restore-thirdparty` checks the marker:
+
+- **No marker** → proceed normally.
+- **Marker for the SAME snapshot** → treat as a recovery, log a warning, continue.
+- **Marker for a DIFFERENT snapshot** → refuse with exit code 3 and the three options:
+  1. `recover-thirdparty` — re-run the marked snapshot to completion (recommended).
+  2. `restore-thirdparty --force-clean <snapshot>` — ignore marker and proceed anyway (risky).
+  3. `clear-restore-state` — just delete the marker (only if you have verified the device is healthy).
+
+The marker payload also includes a `transport_retries` counter (cumulative across the restore) so flaky devices are visible during recovery.
+
+### Exit codes
+
+- `0` — success.
+- `1` — usage/configuration error (missing archive, bad arguments, no devices, etc.).
+- `2` — restore/backup aborted (transport drop survived retries, or critical command failed). Marker remains on device for `restore-thirdparty`.
+- `3` — preflight refusal (`restore-thirdparty` saw a marker for a different snapshot and `--force-clean` was not set).
+
+### Recommended queue-runner pattern
+
+For scripts that restore many snapshots back-to-back:
+
+```bash
+for snap in snap-1 snap-2 snap-3 snap-4 snap-5; do
+  python3 recovery_tool.py restore-thirdparty "$snap"
+  rc=$?
+  if [ $rc -eq 2 ]; then
+    # Restore aborted partway. Re-run the marked snapshot to completion
+    # before moving on to the next one in the queue.
+    python3 recovery_tool.py recover-thirdparty || exit 1
+  elif [ $rc -eq 3 ]; then
+    # Device was already half-restored from a prior run. Recover first,
+    # then retry the current snapshot.
+    python3 recovery_tool.py recover-thirdparty || exit 1
+    python3 recovery_tool.py restore-thirdparty "$snap" || exit 1
+  elif [ $rc -ne 0 ]; then
+    exit $rc
+  fi
+done
+```
+
+The same loop without these checks is what bricks devices when one restore in the middle of the queue aborts.
+
 ## Snapshot Layout
 
 Snapshots are created under:
@@ -311,6 +421,19 @@ python3 recovery_tool.py --verbose backup-thirdparty --name tp_all
 python3 recovery_tool.py --verbose restore-thirdparty tp_all
 ```
 
+### D) Recovering from an aborted `restore-thirdparty`
+
+```bash
+# Previous run aborted with exit 2 (or a queued run exited 3 on refusal).
+# Re-run the marked snapshot to completion:
+python3 recovery_tool.py --verbose recover-thirdparty
+
+# If you know the device is fine and just want to dismiss the marker:
+python3 recovery_tool.py clear-restore-state
+```
+
+See [Resilience & Recovery](#resilience--recovery) for details and the queue-runner pattern.
+
 ## Help Commands
 
 ```bash
@@ -321,6 +444,8 @@ python3 recovery_tool.py backup-app -h
 python3 recovery_tool.py restore-path -h
 python3 recovery_tool.py restore-app -h
 python3 recovery_tool.py restore-thirdparty -h
+python3 recovery_tool.py recover-thirdparty -h
+python3 recovery_tool.py clear-restore-state -h
 python3 recovery_tool.py pairip-fix -h
 ```
 
@@ -344,4 +469,32 @@ Tool logs:
 ```bash
 ls -la snapshots/<snapshot>/logs/
 tail -n 200 snapshots/<snapshot>/logs/*.log
+```
+
+### Common error messages
+
+- `restore-failed: <phase>: <reason> (lost adb connection, rc=1): adb: ...`
+  Transport drop survived 3 retries. The device is unreachable. Re-seat USB, run `adb devices`, then `recover-thirdparty`.
+
+- `restore-failed: <phase>: <reason> (command failed, rc=1): ...`
+  The device shell returned non-zero from a critical command. Inspect the stderr excerpt and `snapshots/<name>/logs/restore-thirdparty.log`.
+
+- `Refusing to restore: device is in a half-restored state from a previous run.`
+  A `restore-thirdparty` marker is on the device from a prior aborted run. Run `recover-thirdparty` (recommended), or `restore-thirdparty --force-clean <snap>`, or `clear-restore-state` if the device is verified healthy.
+
+- `[transport-retry] transport drop detected during phase '...' (attempt N/3); waiting for device and retrying...`
+  Normal — the auto-retry loop absorbed a short USB blip. Counts are accumulated in the restore-state marker's `transport_retries` field; a high count over a single restore means the cable or device is flaky.
+
+### Inspecting the restore-state marker
+
+The device-side marker, if present:
+
+```bash
+adb shell su -c 'cat /data/local/tmp/snaptool-restore.state'
+```
+
+Output is a single-line JSON with `snapshot`, `cmd`, `started_at`, `last_phase`, `phase_count`, and `transport_retries`. To clear it manually after verifying the device is healthy:
+
+```bash
+python3 recovery_tool.py clear-restore-state
 ```
