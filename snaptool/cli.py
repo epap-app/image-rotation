@@ -1602,13 +1602,23 @@ def cmd_restore_path(args) -> int:
         )
     execu.exec_restore_path(plan, tar_index, local_tar=paths.temp_tar, runtime_state=runtime_state_for_restore)
 
+    service_outages = adb.service_unavailable_count
+
     logger.info("Cleaning up host temp tar...")
     try:
         paths.temp_tar.unlink()
     except FileNotFoundError:
         pass
 
-    logger.info("Restore-path complete.")
+    if service_outages > 0:
+        logger.warning(
+            "Restore-path completed with %d system-service unavailability event(s); "
+            "some post-stage runtime state may have been dropped.",
+            service_outages,
+        )
+        logger.info("Restore-path finished with warnings (service_unavailable=%d).", service_outages)
+    else:
+        logger.info("Restore-path complete.")
     return 0
 
 
@@ -1728,13 +1738,23 @@ def cmd_restore_app(args) -> int:
             except FileNotFoundError:
                 pass
 
+    service_outages = adb.service_unavailable_count
+
     logger.info("Cleaning up host temp tar...")
     try:
         paths.temp_tar.unlink()
     except FileNotFoundError:
         pass
 
-    logger.info("Restore-app complete.")
+    if service_outages > 0:
+        logger.warning(
+            "Restore-app completed with %d system-service unavailability event(s); "
+            "some post-stage runtime state may have been dropped.",
+            service_outages,
+        )
+        logger.info("Restore-app finished with warnings (service_unavailable=%d).", service_outages)
+    else:
+        logger.info("Restore-app complete.")
     return 0
 
 
@@ -1932,8 +1952,22 @@ def cmd_restore_thirdparty(args) -> int:
                 pass
 
     # Only reached on success — exec_restore_path raises on abort, and the
-    # finally above doesn't swallow it. Mark the device as cleanly restored.
-    restore_state.clear()
+    # finally above doesn't swallow it. But "no abort" doesn't mean "clean":
+    # per-call `cmd appops`/`pm grant` failures via the device shell are
+    # non-critical and were warned-not-raised. If any of those hit
+    # `Can't find service: X`, post-stage runtime state was partially
+    # dropped — the restore is technically incomplete.
+    service_outages = adb.service_unavailable_count
+    if service_outages > 0:
+        logger.warning(
+            "Restore-thirdparty completed with %d system-service unavailability "
+            "event(s) — some post-stage runtime state (permissions/appops) was "
+            "dropped because system_server was not responding. Marker retained "
+            "for re-run. Run `recover-thirdparty` to retry this snapshot.",
+            service_outages,
+        )
+    else:
+        restore_state.clear()
 
     logger.info("Cleaning up host temp tar...")
     try:
@@ -1941,7 +1975,13 @@ def cmd_restore_thirdparty(args) -> int:
     except FileNotFoundError:
         pass
 
-    logger.info("Restore-thirdparty complete.")
+    if service_outages > 0:
+        logger.info(
+            "Restore-thirdparty finished with warnings (service_unavailable=%d).",
+            service_outages,
+        )
+    else:
+        logger.info("Restore-thirdparty complete.")
     return 0
 
 

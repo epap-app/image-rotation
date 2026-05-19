@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shlex
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,61 @@ from .planner import RestorePlan
 from .restore_state import RestoreState
 from .runner import SnaptoolAbortedError
 from .tar_index import TarIndex
+
+
+# Appops whose mode is owned by a runtime permission. On Android 11+ the
+# AppOpsService policy refuses (or just ignores) direct `cmd appops set`
+# calls for these — the appop is automatically updated when the underlying
+# `pm grant`/`pm revoke` runs. Setting them via `cmd appops set` is at best
+# a redundant no-op and at worst contributes to AppOpsService contention
+# during system_server boot (where PermissionPolicyService is already
+# replaying the same sync internally, and on some Android versions the
+# resulting RuntimeExceptions stall the service). We skip them entirely
+# in `_apply_runtime_state` and let `pm grant` handle the appop side.
+_RUNTIME_PERMISSION_BACKED_APPOPS = frozenset({
+    # Location
+    "COARSE_LOCATION", "FINE_LOCATION", "ACCESS_BACKGROUND_LOCATION",
+    # Contacts
+    "READ_CONTACTS", "WRITE_CONTACTS",
+    # Phone / Call Log
+    "READ_CALL_LOG", "WRITE_CALL_LOG", "PROCESS_OUTGOING_CALLS",
+    "CALL_PHONE", "ANSWER_PHONE_CALLS",
+    "READ_PHONE_STATE", "READ_PHONE_NUMBERS",
+    "ADD_VOICEMAIL", "USE_SIP", "ACCEPT_HANDOVER",
+    # Calendar
+    "READ_CALENDAR", "WRITE_CALENDAR",
+    # SMS
+    "READ_SMS", "RECEIVE_SMS", "RECEIVE_MMS", "RECEIVE_WAP_PUSH",
+    "SEND_SMS", "READ_CELL_BROADCASTS",
+    # Sensors / Activity
+    "BODY_SENSORS", "BODY_SENSORS_BACKGROUND",
+    "ACTIVITY_RECOGNITION",
+    # Storage / Media
+    "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+    "ACCESS_MEDIA_LOCATION",
+    "READ_MEDIA_AUDIO", "READ_MEDIA_IMAGES", "READ_MEDIA_VIDEO",
+    "READ_MEDIA_VISUAL_USER_SELECTED",
+    # Camera / Microphone
+    "CAMERA", "RECORD_AUDIO",
+    # Bluetooth (Android 12+)
+    "BLUETOOTH_SCAN", "BLUETOOTH_CONNECT", "BLUETOOTH_ADVERTISE",
+    # WiFi (Android 13+)
+    "NEARBY_WIFI_DEVICES",
+    # Notifications (Android 13+)
+    "POST_NOTIFICATION",
+    # UWB / Ranging (Android 14+)
+    "RANGING", "UWB_RANGING",
+    # Health Connect (Android 14+)
+    "READ_HEART_RATE", "READ_OXYGEN_SATURATION", "READ_SKIN_TEMPERATURE",
+})
+
+# Pause between packages in `_apply_runtime_state`. After applying ~20-30
+# adb calls for one package (force-stop, appops reset, perm grants/revokes,
+# non-runtime-perm appops), give AppOpsService a beat to settle before
+# the next package's flood. Cheap insurance against accumulating contention
+# pressure on slower devices / preview builds. Total overhead for ~12
+# packages is ~1.2s.
+_RUNTIME_STATE_INTER_PACKAGE_DELAY_S = 0.1
 
 
 @dataclass(frozen=True)
@@ -181,6 +237,32 @@ class RestoreExecutor:
                     exc,
                 )
 
+            # Framework-services-ready check. `ensure_root` only verifies
+            # `su -c id` works; system_server can still be booting and not
+            # publishing PMS/AMS/AppOpsService. If we return now, the
+            # caller's post-stage runtime state replay would flood a
+            # not-yet-ready system_server and trigger crash cycles. Block
+            # here until services answer, or abort if they don't.
+            body_already_raised = sys.exc_info()[0] is not None
+            try:
+                self.adb.ensure_framework_ready(
+                    phase="restore: framework-ready after restart",
+                )
+            except SnaptoolAbortedError as exc:
+                if body_already_raised:
+                    self.logger.error(
+                        "FRAMEWORK NOT READY after restart (also): %s. "
+                        "Post-stage runtime state cannot be applied cleanly.",
+                        exc,
+                    )
+                else:
+                    raise
+            except Exception as exc:
+                self.logger.error(
+                    "FRAMEWORK-READY CHECK FAILED unexpectedly after framework restart: %s",
+                    exc,
+                )
+
     def _restart_keystore_safety_net(self) -> None:
         """Best-effort, swallow-all restart of keystore2/credstore. Used inside
         a finally on the keystore swap scripts: if the swap script aborted
@@ -213,6 +295,44 @@ class RestoreExecutor:
                 "accounts/keystore may be inaccessible until reboot. (%s)",
                 exc,
             )
+
+    # Substrings in stderr that indicate system_server (or a service it owns)
+    # is unavailable to a `cmd`/`pm`/`am` call. When we see this mid-replay,
+    # we MUST stop hammering — every subsequent call will worsen the cascade
+    # and risks tripping the kernel watchdog into a full device reboot.
+    _SVC_UNAVAILABLE_MARKERS = ("Can't find service:", "Can not find service")
+
+    def _replay_adb_call(self, args: list[str]) -> "CmdResult":
+        """Run a non-critical adb call from `_apply_runtime_state`, with an
+        in-flight circuit breaker.
+
+        If the call returns `Can't find service: X` in stderr, system_server
+        is unavailable. Continuing the flood at this point is what triggers
+        the watchdog cascade. We pause and call `ensure_framework_ready` —
+        which either waits for system_server to publish its services again
+        (transient hiccup; we resume the replay), or times out and raises
+        `SnaptoolAbortedError` (the restore aborts cleanly, marker is
+        retained, queue runner picks up via `recover-thirdparty`).
+        """
+        res = self.adb.adb(args, check=False)
+        if (
+            res.rc != 0
+            and res.stderr
+            and any(m in res.stderr for m in self._SVC_UNAVAILABLE_MARKERS)
+        ):
+            stderr_first = res.stderr.strip().splitlines()[0][:160]
+            self.logger.warning(
+                "[runtime-state] system-service unavailable mid-replay "
+                "(stderr: %s); pausing for system_server to recover ...",
+                stderr_first,
+            )
+            self.adb.ensure_framework_ready(
+                phase="restore: framework-ready during runtime state replay",
+            )
+            self.logger.info(
+                "[runtime-state] system_server recovered; resuming replay."
+            )
+        return res
 
     def _apply_runtime_state(
         self,
@@ -255,8 +375,8 @@ class RestoreExecutor:
                         continue
 
                     uid_s_arg = str(uid)
-                    self.adb.adb(["shell", "am", "force-stop", "--user", uid_s_arg, pkg], check=False)
-                    self.adb.adb(["shell", "cmd", "appops", "reset", "--user", uid_s_arg, pkg], check=False)
+                    self._replay_adb_call(["shell", "am", "force-stop", "--user", uid_s_arg, pkg])
+                    self._replay_adb_call(["shell", "cmd", "appops", "reset", "--user", uid_s_arg, pkg])
 
                     perms = state.get("runtime_permissions")
                     if isinstance(perms, dict):
@@ -265,26 +385,45 @@ class RestoreExecutor:
                                 continue
                             if isinstance(granted, bool):
                                 if granted:
-                                    self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
+                                    self._replay_adb_call(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm])
                                 elif apply_revokes:
-                                    self.adb.adb(["shell", "pm", "revoke", "--user", uid_s_arg, pkg, perm], check=False)
+                                    self._replay_adb_call(["shell", "pm", "revoke", "--user", uid_s_arg, pkg, perm])
                             elif granted:
-                                self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
+                                self._replay_adb_call(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm])
                     elif isinstance(perms, list):
                         for perm in perms:
                             if not isinstance(perm, str):
                                 continue
-                            self.adb.adb(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm], check=False)
+                            self._replay_adb_call(["shell", "pm", "grant", "--user", uid_s_arg, pkg, perm])
 
                     appops = state.get("appops")
                     if isinstance(appops, dict):
+                        skipped_rt = 0
                         for op, mode in appops.items():
                             if not isinstance(op, str) or not isinstance(mode, str):
                                 continue
-                            self.adb.adb(
+                            if op in _RUNTIME_PERMISSION_BACKED_APPOPS:
+                                # AppOps tied to runtime permissions are set
+                                # automatically by `pm grant/revoke` above.
+                                # `cmd appops set` for these is either silently
+                                # ignored (same-uid) or rejected with
+                                # RuntimeException (cross-uid) on modern
+                                # Android — wasted call + AppOpsService load.
+                                skipped_rt += 1
+                                continue
+                            self._replay_adb_call(
                                 ["shell", "cmd", "appops", "set", "--user", uid_s_arg, pkg, op, mode],
-                                check=False,
                             )
+                        if skipped_rt:
+                            self.logger.debug(
+                                "[runtime-state] %s: skipped %d runtime-perm-backed appops "
+                                "(handled via pm grant/revoke)",
+                                pkg, skipped_rt,
+                            )
+
+                # Brief throttle between packages — gives AppOpsService time
+                # to drain its queue before the next package's flood.
+                time.sleep(_RUNTIME_STATE_INTER_PACKAGE_DELAY_S)
 
     def _permission_state_file_fixups(self, user_ids: list[int]) -> None:
         self.logger.info("Post-restore: permission state file fixups ...")

@@ -21,6 +21,25 @@ _WAIT_FOR_DEVICE_TIMEOUT_S = 30
 _SHELL_PROBE_TIMEOUT_S = 10
 _SHELL_PROBE_MARKER = "SNAPTOOL_PROBE_OK"
 
+# Framework-ready probe (gap #1 + #2): after `stop ; start` of zygote,
+# system_server takes 5-30+s to publish AMS/PMS/AppOpsService. Hitting it
+# with binder calls during that window triggers crash-restart cycles that
+# eventually trip the watchdog and full-reboot the device. We poll
+# `service check NAME` until the services we care about are published.
+_FRAMEWORK_READY_SERVICES = ("package", "appops", "activity")
+_FRAMEWORK_READY_TIMEOUT_S = 60
+_FRAMEWORK_READY_POLL_S = 0.5
+_FRAMEWORK_READY_POLL_S_MAX = 2.0
+
+# Stderr substrings that indicate a system_server-side service is not
+# available to a `cmd`/`pm`/`am` call. Tracked as a counter so the CLI
+# can refuse to declare a restore "completed cleanly" if any of these
+# slipped past the framework-ready preflight.
+_SERVICE_UNAVAILABLE_MARKERS = (
+    "Can't find service:",
+    "Can not find service",
+)
+
 
 @dataclass
 class AdbClient:
@@ -29,6 +48,12 @@ class AdbClient:
     # Cumulative count of transport retries performed during this client's
     # lifetime. Exposed for telemetry (RestoreState surfaces it on the marker).
     transport_retries: int = field(default=0)
+    # Cumulative count of calls that returned a "Can't find service: X"
+    # stderr — indicates system_server (or a specific service it owns)
+    # was not responding to a `cmd`/`pm`/`am` call. CLI uses this at end
+    # of restore to decide whether the run actually completed cleanly or
+    # silently dropped post-stage state.
+    service_unavailable_count: int = field(default=0)
 
     def _base(self) -> list[str]:
         cmd = ["adb"]
@@ -146,6 +171,14 @@ class AdbClient:
         for attempt in range(_TRANSPORT_RETRY_LIMIT + 1):
             res = self._run_cmd(cmd, input_bytes=input_bytes)
             last_res = res
+
+            # Track system-service unavailability separately from transport
+            # failures. This is a device-side signal (system_server / a
+            # framework service not responding), not an adb-link signal,
+            # so it doesn't trigger the transport retry — just a counter.
+            if res.rc != 0 and res.stderr:
+                if any(m in res.stderr for m in _SERVICE_UNAVAILABLE_MARKERS):
+                    self.service_unavailable_count += 1
 
             if res.rc == 0:
                 return res
@@ -349,6 +382,95 @@ class AdbClient:
                 stderr=stderr_first or res.stderr,
                 transport=False,
             )
+
+    def ensure_framework_ready(
+        self,
+        phase: str = "adb framework-ready check",
+        timeout_s: int = _FRAMEWORK_READY_TIMEOUT_S,
+        services: tuple[str, ...] = _FRAMEWORK_READY_SERVICES,
+    ) -> None:
+        """Wait until the framework is *actually* ready to accept our flood
+        of `cmd appops`/`pm grant`/`am force-stop` calls.
+
+        `ensure_root` only verifies `su -c id` works — `id` is libc-only and
+        never touches system_server. Naive `sleep 2` after `start zygote`
+        isn't enough either — system_server's boot-phase
+        `PermissionPolicyService.synchronizePermissionsAndAppOpsForUser`
+        is doing its own internal AppOps work during early boot, and AppOps
+        binder threads can be locked up handling exceptions/contention.
+        Our calls land at the binder layer with no service responding fast
+        enough; `cmd` reports `Can't find service: appops` even though the
+        service is technically registered.
+
+        We poll TWO signals together:
+        1. `service check <name>`: the services are registered with
+           servicemanager (necessary but not sufficient).
+        2. `getprop sys.boot_completed == 1`: ActivityManagerService has
+           completed all `onBootPhase` callbacks, including PermissionPolicy
+           syncing. This is the canonical "system is ready" property.
+
+        Both must be true. Raises SnaptoolAbortedError on timeout.
+        """
+        start = time.monotonic()
+        # Chain service-check + getprop into one shell round-trip. Marker
+        # prefix on the boot_completed line so we don't confuse it with
+        # a service-check line.
+        probe = (
+            " ; ".join(f"service check {s}" for s in services)
+            + " ; echo BOOT_COMPLETED=$(getprop sys.boot_completed)"
+        )
+        poll = _FRAMEWORK_READY_POLL_S
+        first_iter = True
+        last_missing: list[str] = list(services)
+        last_boot_completed = False
+        while True:
+            res = self.shell_root(
+                probe,
+                critical=False,
+                phase=phase,
+                reason="framework-ready probe",
+            )
+            stdout = res.stdout or ""
+            missing = [s for s in services if f"Service {s}: found" not in stdout]
+            boot_completed = "BOOT_COMPLETED=1" in stdout
+            last_missing = missing
+            last_boot_completed = boot_completed
+
+            if not missing and boot_completed:
+                elapsed = time.monotonic() - start
+                if not first_iter:
+                    self.logger.info(
+                        "[framework-ready] services published + sys.boot_completed=1 after %.1fs",
+                        elapsed,
+                    )
+                return
+            elapsed = time.monotonic() - start
+            if first_iter:
+                self.logger.info(
+                    "[framework-ready] waiting for framework: missing services=%s, boot_completed=%s",
+                    ", ".join(missing) or "(none)",
+                    "1" if boot_completed else "0",
+                )
+                first_iter = False
+            if elapsed >= timeout_s:
+                raise SnaptoolAbortedError(
+                    phase=phase,
+                    reason=(
+                        f"framework not ready after {timeout_s}s "
+                        f"(missing services: {', '.join(last_missing) or 'none'}; "
+                        f"sys.boot_completed={'1' if last_boot_completed else '0'}). "
+                        f"system_server may have stalled during restart. "
+                        f"Check `adb shell service list` and `adb shell getprop sys.boot_completed`."
+                    ),
+                    cmd=res.cmd,
+                    rc=res.rc,
+                    stderr=res.stderr,
+                    transport=False,
+                )
+            time.sleep(poll)
+            # Backoff slightly so we don't spam the log/device while waiting.
+            if poll < _FRAMEWORK_READY_POLL_S_MAX:
+                poll = min(poll + 0.5, _FRAMEWORK_READY_POLL_S_MAX)
 
     def ensure_device_online(self, phase: str = "adb preflight", timeout_s: int = 5) -> None:
         """Pre-flight check before a critical stage. Verifies the device is
