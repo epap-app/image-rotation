@@ -1487,6 +1487,15 @@ def cmd_restore_path(args) -> int:
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
     adb.ensure_root(phase="restore-path: root preflight")
 
+    # Preflight: refuse if device is at a dangerous RescueParty level.
+    bl_rc = _check_bootloop_safe(
+        adb, logger,
+        force=bool(getattr(args, "force_bootloop", False)),
+        phase="restore-path",
+    )
+    if bl_rc:
+        return bl_rc
+
     logger.info("Using snapshot: %s", paths.snap_dir)
     logger.info("Decompressing zstd archive -> temp tar...")
     run_checked(["zstd", "-d", "-f", str(paths.archive_zst), "-o", str(paths.temp_tar)], logger)
@@ -1634,6 +1643,15 @@ def cmd_restore_app(args) -> int:
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
     adb.ensure_root(phase="restore-app: root preflight")
 
+    # Preflight: refuse if device is at a dangerous RescueParty level.
+    bl_rc = _check_bootloop_safe(
+        adb, logger,
+        force=bool(getattr(args, "force_bootloop", False)),
+        phase="restore-app",
+    )
+    if bl_rc:
+        return bl_rc
+
     meta = _read_app_meta(paths.snap_dir / APP_META_FILE)
     package = args.package or meta.get("package")
     if not package:
@@ -1772,6 +1790,100 @@ def _refusal_message(state: dict) -> str:
     )
 
 
+# Mitigation-count thresholds. Android's RescueParty escalation ladder
+# (per AOSP PackageWatchdog):
+#   1: ALL_DEVICE_CONFIG_RESET            — resets device_config overrides
+#   2: WARM_REBOOT                        — soft reboot; no data loss
+#   3: RESET_SETTINGS_UNTRUSTED_DEFAULTS  — wipes user settings overrides
+#   4: RESET_SETTINGS_TRUSTED_DEFAULTS    — wipes settings more aggressively
+#   5: FACTORY_RESET                      — wipes /data on reboot
+#
+# We refuse at mitigation-count >= 1 because at any non-zero mitigation
+# level, PackageWatchdog's SECONDARY trigger condition fires:
+#   (performedMitigationsDuringWindow() && count > 1)
+# i.e. just 2 SYSTEM_RESTART events trip the detector instead of 5. Even
+# with our boot-loop counter reset in place, a single failure of the
+# reset (a transport drop racing with the next zygote stop, an SELinux
+# denial, etc.) would escalate the device. The cost of refusing is one
+# `snaptool clear-bootloop-state` invocation; the cost of proceeding and
+# tripping at e.g. mc=3 is a settings wipe. Easy choice.
+_BOOTLOOP_REFUSE_AT_MITIGATION_COUNT = 1
+
+
+def _read_mitigation_count(adb: AdbClient, logger) -> int:
+    """Read rescue-party-observer's mitigation-count from
+    /data/system/package-watchdog.xml. Returns 0 if the file is absent or
+    the observer entry is missing; -1 on a parse error (caller treats as
+    "unknown, proceed with a warning").
+    """
+    res = adb.shell_root(
+        "cat /data/system/package-watchdog.xml 2>/dev/null || true",
+        critical=False,
+        phase="bootloop-preflight: read package-watchdog.xml",
+    )
+    text = (res.stdout or "").strip()
+    if not text:
+        return 0
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        logger.warning(
+            "[bootloop-preflight] could not parse package-watchdog.xml: %s",
+            exc,
+        )
+        return -1
+    for obs in root.findall("observer"):
+        if obs.get("name") == "rescue-party-observer":
+            try:
+                return int(obs.get("mitigation-count", "0"))
+            except ValueError:
+                return -1
+    return 0
+
+
+def _check_bootloop_safe(adb: AdbClient, logger, *, force: bool, phase: str) -> int:
+    """Pre-flight check: refuse the restore if the device's RescueParty
+    mitigation-count is non-zero. See _BOOTLOOP_REFUSE_AT_MITIGATION_COUNT
+    for why we refuse aggressively rather than warn-and-proceed.
+
+    Returns 0 to proceed, non-zero exit code to abort.
+    """
+    mc = _read_mitigation_count(adb, logger)
+    if mc < 0:
+        logger.warning(
+            "[bootloop-preflight] could not determine mitigation-count from "
+            "package-watchdog.xml; proceeding (boot-loop counter reset should "
+            "still keep this restore safe)."
+        )
+        return 0
+    if mc < _BOOTLOOP_REFUSE_AT_MITIGATION_COUNT:
+        return 0
+    if force:
+        logger.warning(
+            "[bootloop-preflight] mitigation-count=%d, --force-bootloop set; "
+            "proceeding at your own risk. A single failure of the boot-loop "
+            "counter reset would escalate the device.",
+            mc,
+        )
+        return 0
+    logger.error(
+        "Refusing %s: device is at RescueParty mitigation-count=%d.\n"
+        "At mitigation-count > 0, PackageWatchdog's secondary trigger\n"
+        "    (performedMitigationsDuringWindow() && count > 1)\n"
+        "makes the device tripable on just 2 SYSTEM_RESTART events (vs. the\n"
+        "usual 5). A single failure of our boot-loop counter reset would\n"
+        "escalate the device (WARM_REBOOT at mc=1, settings reset at mc=2-3,\n"
+        "FACTORY_RESET at mc>=4).\n"
+        "Recovery:\n"
+        "  1. snaptool clear-bootloop-state\n"
+        "       wipes the escalation state and reboots the device\n"
+        "  2. then retry this restore\n"
+        "To override (NOT RECOMMENDED), pass --force-bootloop.",
+        phase, mc,
+    )
+    return 4
+
+
 def cmd_restore_thirdparty(args) -> int:
     cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
     paths = SnapshotPaths.for_snapshot(cfg.snap_root, args.snapshot)
@@ -1783,6 +1895,16 @@ def cmd_restore_thirdparty(args) -> int:
     logger = setup_logging(cfg.verbose, log_file=paths.logs_dir / "restore-thirdparty.log")
     adb = AdbClient(logger=logger, serial=cfg.adb_serial)
     adb.ensure_root(phase="restore-thirdparty: root preflight")
+
+    # Preflight: refuse to start if the device is already at a dangerous
+    # RescueParty escalation level (Layer 2).
+    bl_rc = _check_bootloop_safe(
+        adb, logger,
+        force=bool(getattr(args, "force_bootloop", False)),
+        phase="restore-thirdparty",
+    )
+    if bl_rc:
+        return bl_rc
 
     # Preflight: refuse to start on top of a half-restored device unless the
     # operator explicitly chose what to do about it.
@@ -2048,6 +2170,7 @@ def cmd_recover_thirdparty(args) -> int:
         user=None,
         auth_pkg=None,
         force_clean=True,
+        force_bootloop=False,
     )
     return cmd_restore_thirdparty(rec)
 
@@ -2076,6 +2199,118 @@ def cmd_clear_restore_state(args) -> int:
         phase="clear-restore-state",
     )
     logger.info("Restore-state marker cleared.")
+    return 0
+
+
+# Files that hold Android's RescueParty / PackageWatchdog escalation state.
+# /metadata/watchdog/mitigation_count.txt is the durable source — on a
+# separate partition (/metadata, f2fs) that survives /data wipes — and
+# contains a Java-serialized HashMap of observer-name -> mitigation count.
+# /data/system/package-watchdog.xml is the same data mirrored to /data as
+# XML; system_server writes both. /data/system/crashrecovery-events.txt is
+# the human-readable audit log of completed escalations (informational).
+_BOOTLOOP_METADATA_FILE = "/metadata/watchdog/mitigation_count.txt"
+_BOOTLOOP_PACKAGE_WATCHDOG_XML = "/data/system/package-watchdog.xml"
+_BOOTLOOP_EVENTS_TXT = "/data/system/crashrecovery-events.txt"
+
+
+def cmd_clear_bootloop_state(args) -> int:
+    """Wipe Android's RescueParty / PackageWatchdog escalation state.
+
+    Use when the device is stuck at a non-zero mitigation level from
+    previous back-to-back restores (or any other cause of a recent
+    boot-loop trigger). Past mitigation-count=2 the next escalation
+    starts wiping system settings, and at mitigation-count=4 the device
+    factory-resets on the next trip — neither is something we want to
+    risk by running another restore.
+
+    Wipes the persistent state on /metadata, the /data mirror, and the
+    transient runtime counters, then reboots the device so the cleared
+    state takes effect before system_server can flush its in-memory
+    state back to disk.
+    """
+    cfg = ToolConfig.default(adb_serial=args.serial, verbose=args.verbose, snap_root=args.snap_root)
+    logger = setup_logging(cfg.verbose, log_file=None)
+    adb = AdbClient(logger=logger, serial=cfg.adb_serial)
+    adb.ensure_root(phase="clear-bootloop-state: root preflight")
+
+    # Dump current state for the audit trail so the operator can see
+    # exactly what's being cleared.
+    #
+    # Use shell_script (`su\n...\nexit\nexit\n`) rather than shell_root
+    # (`su -c "...; ..."`) because Magisk's su -c only runs the FIRST
+    # semicolon-chained command as root — the subsequent `cat`s and
+    # `getprop`s on root-only files would silently return empty under
+    # the shell user.
+    dump_script = (
+        "su\n"
+        "echo '--- package-watchdog.xml ---'\n"
+        f"cat {shlex.quote(_BOOTLOOP_PACKAGE_WATCHDOG_XML)} 2>/dev/null || echo '(absent)'\n"
+        "echo\n"
+        "echo '--- mitigation_count.txt (existence/size) ---'\n"
+        f"ls -la {shlex.quote(_BOOTLOOP_METADATA_FILE)} 2>/dev/null || echo '(absent)'\n"
+        "echo '--- crashrecovery-events.txt ---'\n"
+        f"cat {shlex.quote(_BOOTLOOP_EVENTS_TXT)} 2>/dev/null || echo '(absent)'\n"
+        "echo '--- transient props ---'\n"
+        "getprop crashrecovery.rescue_boot_count\n"
+        "getprop crashrecovery.rescue_boot_start\n"
+        "exit\nexit\n"
+    )
+    state_dump = adb.shell_script(
+        dump_script,
+        critical=False,
+        phase="clear-bootloop-state: state dump",
+    )
+    logger.info(
+        "Current RescueParty/PackageWatchdog state on device:\n%s",
+        (state_dump.stdout or "").rstrip(),
+    )
+
+    if not args.yes:
+        try:
+            answer = input(
+                "Wipe all RescueParty escalation state and reboot? Type YES: "
+            )
+        except EOFError:
+            answer = ""
+        if answer.strip() != "YES":
+            logger.info("Aborting clear-bootloop-state.")
+            return 1
+
+    # Wipe order: metadata file first (durable), then the /data mirror,
+    # then the audit log, then transient props. system_server is still
+    # running and may try to rewrite the files if it processes an
+    # observer event between now and the reboot — that's why we reboot
+    # immediately afterwards by default.
+    script = (
+        "su\n"
+        f"rm -f {shlex.quote(_BOOTLOOP_METADATA_FILE)}\n"
+        f"rm -f {shlex.quote(_BOOTLOOP_PACKAGE_WATCHDOG_XML)}\n"
+        f"rm -f {shlex.quote(_BOOTLOOP_EVENTS_TXT)}\n"
+        "setprop crashrecovery.rescue_boot_count 0\n"
+        "setprop crashrecovery.rescue_boot_start 0\n"
+        "exit\nexit\n"
+    )
+    adb.shell_script(
+        script,
+        critical=False,
+        phase="clear-bootloop-state: wipe",
+    )
+    logger.info("Boot-loop state wiped.")
+
+    if args.no_reboot:
+        logger.warning(
+            "--no-reboot set: skipping reboot. system_server may rewrite "
+            "%s and %s from in-memory state before you reboot manually. "
+            "Run `adb reboot` as soon as practical.",
+            _BOOTLOOP_METADATA_FILE,
+            _BOOTLOOP_PACKAGE_WATCHDOG_XML,
+        )
+        return 0
+
+    logger.info("Rebooting device to apply cleared state ...")
+    adb.adb(["reboot"], check=False, phase="clear-bootloop-state: reboot")
+    logger.info("Reboot issued. Device will return shortly.")
     return 0
 
 
@@ -2288,6 +2523,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="apps",
         help="apps=installed minus overlays; all=all installed; system=system pkgs only; thirdparty=non-system pkgs only",
     )
+    p_restore_path.add_argument(
+        "--force-bootloop",
+        action="store_true",
+        default=False,
+        help=(
+            "Proceed even if the device's RescueParty mitigation-count is "
+            "non-zero. NOT RECOMMENDED — at any non-zero level the detector "
+            "trips after just 2 SYSTEM_RESTART events instead of 5, and a "
+            "single failure of the boot-loop counter reset would escalate "
+            "the device (WARM_REBOOT, settings reset, or FACTORY_RESET "
+            "depending on the current level)."
+        ),
+    )
     p_restore_path.set_defaults(func=cmd_restore_path)
 
     p_restore_app = sub.add_parser("restore-app", help="Restore one app snapshot (+ account manager data)")
@@ -2318,6 +2566,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Skip restoring AccountManager DB files",
     )
+    p_restore_app.add_argument(
+        "--force-bootloop",
+        action="store_true",
+        default=False,
+        help=(
+            "Proceed even if the device's RescueParty mitigation-count is "
+            "non-zero. NOT RECOMMENDED — at any non-zero level the detector "
+            "trips after just 2 SYSTEM_RESTART events instead of 5, and a "
+            "single failure of the boot-loop counter reset would escalate "
+            "the device (WARM_REBOOT, settings reset, or FACTORY_RESET "
+            "depending on the current level)."
+        ),
+    )
     p_restore_app.set_defaults(func=cmd_restore_app)
 
     p_restore_tp = sub.add_parser(
@@ -2346,6 +2607,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Risky — use only if you know the device is in a clean state."
         ),
     )
+    p_restore_tp.add_argument(
+        "--force-bootloop",
+        action="store_true",
+        default=False,
+        help=(
+            "Proceed even if the device's RescueParty mitigation-count is "
+            "non-zero. NOT RECOMMENDED — at any non-zero level the detector "
+            "trips after just 2 SYSTEM_RESTART events instead of 5, and a "
+            "single failure of the boot-loop counter reset would escalate "
+            "the device (WARM_REBOOT, settings reset, or FACTORY_RESET "
+            "depending on the current level)."
+        ),
+    )
     p_restore_tp.set_defaults(func=cmd_restore_thirdparty)
 
     p_recover_tp = sub.add_parser(
@@ -2359,6 +2633,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete the device-side restore-state marker (use only after verifying the device is healthy)",
     )
     p_clear_state.set_defaults(func=cmd_clear_restore_state)
+
+    p_clear_bl = sub.add_parser(
+        "clear-bootloop-state",
+        help=(
+            "Wipe Android RescueParty/PackageWatchdog escalation state and reboot. "
+            "Use after a previous restore tripped the boot-loop detector and "
+            "the device is now sitting at mitigation-count > 0."
+        ),
+    )
+    p_clear_bl.add_argument("--yes", action="store_true", help="Skip the interactive YES confirmation")
+    p_clear_bl.add_argument(
+        "--no-reboot",
+        action="store_true",
+        help=(
+            "Don't reboot at the end. Advanced — the cleared state may not stick "
+            "until system_server is restarted, so reboot manually ASAP."
+        ),
+    )
+    p_clear_bl.set_defaults(func=cmd_clear_bootloop_state)
 
     p_pairip = sub.add_parser(
         "pairip-fix",

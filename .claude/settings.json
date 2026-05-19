@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git remote *)",
+      "Bash(cp /Users/netzwelt/Desktop/EPAP/image-rotation-master/README.md /Users/netzwelt/Desktop/EPAP/image-rotation/README.md)"
+    ]
+  }
+}
